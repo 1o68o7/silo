@@ -1,0 +1,39 @@
+# Silo - Semantic Cocoon (standalone pour dev local)
+# Intégré au docker-compose principal log8ot pour la prod
+version: '3.8'
+
+services:
+  db:
+    image: ankane/pgvector:latest
+    container_name: silo_db
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: semantic_cocoon
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password_secret
+    volumes:
+      - silo_pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    container_name: silo_redis
+    ports:
+      - "6380:6379"
+
+  api:
+    build: .
+    container_name: silo_api
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://admin:password_secret@db:5432/semantic_cocoon
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - .:/app
+
+volumes:
+  silo_pgdata:

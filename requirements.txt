@@ -1,0 +1,25 @@
+# Silo - Semantic Cocoon / OSINT SEO Tool
+# API
+fastapi==0.115.6
+uvicorn[standard]==0.32.1
+
+# Database
+psycopg2-binary==2.9.10
+sqlalchemy==2.0.36
+pgvector==0.3.6
+
+# Crawl & NLP (core - worker)
+trafilatura==2.0.0
+# FastEmbed: version figée pour stabilité (0.4.2 = CLS pooling; 0.6+ = mean pooling)
+fastembed==0.4.2
+networkx==3.4.2
+httpx==0.28.1
+aiohttp>=3.9.0
+redis==5.2.1
+
+# Brief stack: Scrapling (StealthyFetcher) + spaCy + CDlib
+scrapling[fetchers]>=0.4.0
+spacy>=3.7.0
+cdlib>=0.3.0
+lxml>=5.0.0
+numpy>=1.24.0

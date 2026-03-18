@@ -1,0 +1,29 @@
+# Brief: Scrapling + StealthyFetcher (évasion anti-bot)
+# Base Scrapling avec navigateurs pré-installés
+FROM pyd4vinci/scrapling:latest
+
+WORKDIR /app
+
+# Dépendances Silo (Scrapling déjà inclus)
+RUN pip install --no-cache-dir \
+    trafilatura>=2.0.0 \
+    fastembed==0.4.2 \
+    networkx>=3.4.2 \
+    redis>=5.2.0 \
+    psycopg2-binary>=2.9.10 \
+    sqlalchemy>=2.0.36 \
+    pgvector>=0.3.6 \
+    lxml>=5.0.0 \
+    numpy>=1.24.0 \
+    spacy>=3.7.0 \
+    cdlib>=0.3.0
+
+# Modèle spaCy français
+RUN python -m spacy download fr_core_news_lg
+
+COPY . .
+ENV PYTHONPATH=/app
+
+# L'image Scrapling a ENTRYPOINT ["scrapling"] - on le réinitialise pour lancer notre worker
+ENTRYPOINT []
+CMD ["python", "-m", "worker.run"]
