@@ -8,6 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List
 
@@ -64,6 +65,8 @@ class CrawlConfig(BaseModel):
     run_ner: bool = True
     seed_url: Optional[str] = None  # Override: crawler depuis cette URL (ex: nœud sélectionné)
     url_list: Optional[List[str]] = None  # Liste d'URLs à crawler (uniquement ces URLs, max_depth=0)
+    path_prefix: Optional[str] = None  # Borne le crawl au répertoire (ex. /fr). "" ou null = pas de restriction
+    exclude_urls_with_params: bool = True  # Exclure les URLs avec query string (pagination, utm_*, etc.)
 
 
 # Store en mémoire (fallback si pas de DB)
@@ -153,6 +156,41 @@ app.add_middleware(
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "silo", "db": USE_DB}
+
+
+@app.get("/api/admin/long-queries")
+async def get_long_queries(min_duration_sec: int = 30):
+    """
+    Surveille pg_stat_activity pour requêtes actives trop longtemps.
+    Utile pour détecter blocages (DELETE, etc.).
+    """
+    if not USE_DB:
+        return {"queries": [], "count": 0}
+    try:
+        from database.db import get_session
+        from sqlalchemy import text
+
+        session = get_session()
+        try:
+            r = session.execute(
+                text("""
+                    SELECT pid, state, EXTRACT(EPOCH FROM (now() - query_start))::int as duration_sec,
+                           wait_event_type, wait_event, LEFT(query, 120) as query
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND state = 'active'
+                      AND query NOT LIKE '%pg_stat_activity%'
+                      AND query_start < now() - interval '1 second' * :min_sec
+                    ORDER BY query_start
+                """),
+                {"min_sec": min_duration_sec},
+            )
+            rows = [dict(zip(r.keys(), row)) for row in r.fetchall()]
+            return {"queries": rows, "count": len(rows)}
+        finally:
+            session.close()
+    except Exception as e:
+        return {"queries": [], "count": 0, "error": str(e)}
 
 
 @app.get("/api/projects", response_model=list[Project])
@@ -404,25 +442,37 @@ async def start_crawl(project_id: str, config: Optional[CrawlConfig] = Body(defa
     if cfg.seed_url:
         seed_url = cfg.seed_url
 
+    # path_prefix: null/absent → auto-détection depuis seed_url; "" → pas de restriction
+    path_prefix = cfg.path_prefix
+    if path_prefix is None:
+        from worker.url_utils import extract_lang_path_prefix
+        path_prefix = extract_lang_path_prefix(seed_url)
+    elif path_prefix == "":
+        path_prefix = None
+
     r = _get_redis()
     if r:
         try:
             r.delete(f"{CRAWL_PAUSE_KEY}:{project_id}", f"{CRAWL_STOP_KEY}:{project_id}")
             if cfg.url_list and len(cfg.url_list) > 0:
                 # Mode batch: une job par URL (crawl uniquement ces URLs, pas de suivi des liens)
-                # Exclure les URLs avec paramètres (utm_*, fbclid, etc.) - à filtrer de l'analyse
                 from urllib.parse import urlparse
                 for u in cfg.url_list:
                     u = (u or "").strip()
-                    if u and u.startswith(("http://", "https://")) and not urlparse(u).query:
-                        payload = {
-                            "project_id": project_id,
-                            "seed_url": u,
-                            "max_depth": 0,
-                            "max_pages": 1,
-                            "run_ner": cfg.run_ner,
-                        }
-                        r.rpush(QUEUE_KEY, json.dumps(payload))
+                    if not u or not u.startswith(("http://", "https://")):
+                        continue
+                    if cfg.exclude_urls_with_params and urlparse(u).query:
+                        continue
+                    payload = {
+                        "project_id": project_id,
+                        "seed_url": u,
+                        "max_depth": 0,
+                        "max_pages": 1,
+                        "run_ner": cfg.run_ner,
+                        "path_prefix": path_prefix,
+                        "exclude_urls_with_params": cfg.exclude_urls_with_params,
+                    }
+                    r.rpush(QUEUE_KEY, json.dumps(payload))
             else:
                 payload = {
                     "project_id": project_id,
@@ -430,6 +480,8 @@ async def start_crawl(project_id: str, config: Optional[CrawlConfig] = Body(defa
                     "max_depth": cfg.max_depth,
                     "max_pages": cfg.max_pages,
                     "run_ner": cfg.run_ner,
+                    "path_prefix": path_prefix,
+                    "exclude_urls_with_params": cfg.exclude_urls_with_params,
                 }
                 r.rpush(QUEUE_KEY, json.dumps(payload))
         except Exception:
@@ -460,20 +512,54 @@ async def start_crawl(project_id: str, config: Optional[CrawlConfig] = Body(defa
     return {"ok": True, "message": "Crawl démarré"}
 
 
+# Seuil edges au-delà duquel la suppression est asynchrone. Défaut 0 = toujours async (évite timeout front).
+DELETE_ASYNC_EDGES_THRESHOLD = int(os.environ.get("SILO_DELETE_ASYNC_THRESHOLD", "0"))
+
+
 @app.delete("/api/projects/{project_id}")
-async def delete_project_endpoint(project_id: str):
-    """Supprime un projet et ses données (pages, edges)."""
+async def delete_project_endpoint(project_id: str, async_only: bool = False):
+    """
+    Supprime un projet et ses données (pages, edges).
+    Toujours async par défaut : 202 Accepted, soft delete immédiat, worker en arrière-plan.
+    Évite les timeouts front (30s) sur les projets avec beaucoup de pages.
+    """
     if USE_DB:
         try:
             from database.db import get_session
-            from database.service import delete_project as db_delete
+            from database.service import delete_project as db_delete, get_project, count_project_edges, mark_project_deleted
             session = get_session()
             try:
-                if not db_delete(session, project_id):
+                p = get_project(session, project_id)
+                if not p:
                     raise HTTPException(status_code=404, detail="Projet non trouvé")
-                return {"ok": True, "message": "Projet supprimé"}
-            finally:
+                edges_count = count_project_edges(session, project_id)
                 session.close()
+
+                # Projet volumineux ou async_only: enqueue pour traitement worker
+                if async_only or edges_count >= DELETE_ASYNC_EDGES_THRESHOLD:
+                    r = _get_redis()
+                    if r:
+                        # Soft delete immédiat pour que GET /api/projects exclue le projet tout de suite
+                        session = get_session()
+                        try:
+                            mark_project_deleted(session, project_id)
+                        finally:
+                            session.close()
+                        r.rpush("silo:delete_project_queue", json.dumps({"project_id": project_id}))
+                        return JSONResponse(
+                            status_code=202,
+                            content={"ok": True, "message": "Suppression en cours (arrière-plan)", "project_id": project_id},
+                        )
+                    # Fallback sync si Redis indisponible
+                session = get_session()
+                try:
+                    if not db_delete(session, project_id):
+                        raise HTTPException(status_code=404, detail="Projet non trouvé")
+                    return {"ok": True, "message": "Projet supprimé"}
+                finally:
+                    session.close()
+            except HTTPException:
+                raise
         except HTTPException:
             raise
         except Exception:

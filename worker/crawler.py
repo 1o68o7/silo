@@ -21,7 +21,7 @@ import networkx as nx
 from worker.fetcher import fetch_html, fetch_urls_parallel
 from worker.link_extractor import get_links_with_context
 from worker.ner import extract_entities, extract_entities_batch, anchor_contains_entity
-from worker.url_utils import url_has_query_params
+from worker.url_utils import url_has_query_params, url_matches_path_prefix
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("silo-worker")
@@ -117,6 +117,30 @@ def _check_stop(project_id: str) -> bool:
         return False
 
 
+def run_delete_project(project_id: str) -> bool:
+    """
+    Supprime un projet en arrière-plan (batch avec COMMIT).
+    Appelé par le worker depuis la queue silo:delete_project_queue.
+    """
+    try:
+        from database.db import get_session
+        from database.service import delete_project, get_project
+
+        session = get_session()
+        try:
+            if not get_project(session, project_id, include_deleted=True):
+                logger.warning(f"Projet {project_id} non trouvé pour suppression")
+                return False
+            delete_project(session, project_id)
+            logger.info(f"Projet {project_id} supprimé (async)")
+            return True
+        finally:
+            session.close()
+    except Exception as e:
+        logger.exception(f"Erreur suppression projet {project_id}: {e}")
+        return False
+
+
 def url_to_id(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:16]
 
@@ -146,7 +170,14 @@ def _cosine_sim(a: list, b: list) -> float:
         return dot / (na * nb)
 
 
-def run_crawl_phase1(project_id: str, seed_url: str, max_depth: int = 3, max_pages: int = 50):
+def run_crawl_phase1(
+    project_id: str,
+    seed_url: str,
+    max_depth: int = 3,
+    max_pages: int = 50,
+    path_prefix: str | None = None,
+    exclude_urls_with_params: bool = True,
+):
     """
     Phase 1: Crawl rapide - URLs, structure, silos.
     Optimisations: fetch parallèle, cache pages/edges, batch commits, bulk update Louvain.
@@ -277,7 +308,7 @@ def run_crawl_phase1(project_id: str, seed_url: str, max_depth: int = 3, max_pag
                         h1 = h1_match.group(1).strip()[:512]
 
                     pid = url_to_page_id(project_id, url)
-                    is_excluded = url_has_query_params(url)
+                    is_excluded = exclude_urls_with_params and url_has_query_params(url)
 
                     page = session.query(Page).filter(Page.id == pid, Page.project_id == project_id).first()
                     if page:
@@ -302,9 +333,13 @@ def run_crawl_phase1(project_id: str, seed_url: str, max_depth: int = 3, max_pag
                         session.add(page)
                     existing_page_ids.add(pid)
 
-                    links_data = get_links_with_context(html, url, context_window=LINK_CONTEXT_WINDOW)
+                    links_data = get_links_with_context(
+                        html, url, context_window=LINK_CONTEXT_WINDOW, exclude_urls_with_params=exclude_urls_with_params
+                    )
                     new_edges_data = []
                     for target_url, anchor, context_text, position_ratio in links_data:
+                        if path_prefix and not url_matches_path_prefix(target_url, path_prefix):
+                            continue
                         tid = url_to_page_id(project_id, target_url)
                         if target_url not in discovered:
                             discovered.add(target_url)
@@ -707,12 +742,28 @@ def run_compute_opportunities(project_id: str):
         session.close()
 
 
-def run_crawl(project_id: str, seed_url: str, max_depth: int = 3, max_pages: int = 50, run_ner: bool = True, phase1_only: bool = False):
+def run_crawl(
+    project_id: str,
+    seed_url: str,
+    max_depth: int = 3,
+    max_pages: int = 50,
+    run_ner: bool = True,
+    phase1_only: bool = False,
+    path_prefix: str | None = None,
+    exclude_urls_with_params: bool = True,
+):
     """
     Exécute le crawl: Phase 1 (rapide) puis Phase 2 (NER) si run_ner=True.
     phase1_only=True: arrête après Phase 1 (pour workers séparés, le worker-nlp fera Phase 2).
     """
-    run_crawl_phase1(project_id, seed_url, max_depth=max_depth, max_pages=max_pages)
+    run_crawl_phase1(
+        project_id,
+        seed_url,
+        max_depth=max_depth,
+        max_pages=max_pages,
+        path_prefix=path_prefix,
+        exclude_urls_with_params=exclude_urls_with_params,
+    )
     if _check_stop(project_id):
         return
     if phase1_only:

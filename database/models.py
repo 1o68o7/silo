@@ -34,6 +34,7 @@ class Project(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     status = Column(String(20), default="idle")  # idle | crawling | done | error
     urls_count = Column(Integer, default=0)
+    deleted_at = Column(DateTime, nullable=True)  # Soft delete pour cohérence GET après DELETE async
 
     pages = relationship("Page", back_populates="project", cascade="all, delete-orphan")
     edges = relationship("Edge", back_populates="project", cascade="all, delete-orphan")

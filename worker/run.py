@@ -17,7 +17,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import redis
-from worker.crawler import run_crawl, run_crawl_phase2, run_ner_on_demand, recompute_silos, run_compute_embeddings, run_compute_opportunities, _check_stop
+from worker.crawler import run_crawl, run_crawl_phase2, run_ner_on_demand, recompute_silos, run_compute_embeddings, run_compute_opportunities, run_delete_project, _check_stop
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("silo-worker")
@@ -29,6 +29,7 @@ NER_QUEUE_KEY = "silo:ner_queue"
 RECOMPUTE_SILOS_QUEUE_KEY = "silo:recompute_silos_queue"
 COMPUTE_EMBEDDINGS_QUEUE_KEY = "silo:compute_embeddings_queue"
 COMPUTE_OPPORTUNITIES_QUEUE_KEY = "silo:compute_opportunities_queue"
+DELETE_PROJECT_QUEUE_KEY = "silo:delete_project_queue"
 WORKER_MODE = os.environ.get("SILO_WORKER_MODE", "full").lower()
 # Délai (s) entre jobs crawl pour éviter surcharge CPU (mode url_list = 1 job/URL)
 JOB_DELAY_SECONDS = float(os.environ.get("SILO_JOB_DELAY_SECONDS", "0.5"))
@@ -55,15 +56,15 @@ def main():
         raise
 
     if WORKER_MODE == "crawl":
-        queues = [QUEUE_KEY]
-        logger.info("Worker Silo (mode crawl) démarré — Phase 1 uniquement, push vers phase2_queue")
+        queues = [QUEUE_KEY, DELETE_PROJECT_QUEUE_KEY]
+        logger.info("Worker Silo (mode crawl) démarré — Phase 1 + delete, push vers phase2_queue")
     elif WORKER_MODE == "nlp":
-        queues = [PHASE2_QUEUE_KEY, NER_QUEUE_KEY, RECOMPUTE_SILOS_QUEUE_KEY, COMPUTE_EMBEDDINGS_QUEUE_KEY, COMPUTE_OPPORTUNITIES_QUEUE_KEY]
-        logger.info("Worker Silo (mode nlp) démarré — Phase 2, NER, silos, embeddings, opportunités")
+        queues = [PHASE2_QUEUE_KEY, NER_QUEUE_KEY, RECOMPUTE_SILOS_QUEUE_KEY, COMPUTE_EMBEDDINGS_QUEUE_KEY, COMPUTE_OPPORTUNITIES_QUEUE_KEY, DELETE_PROJECT_QUEUE_KEY]
+        logger.info("Worker Silo (mode nlp) démarré — Phase 2, NER, silos, embeddings, opportunités, delete")
         _preload_nlp_models()
     else:
-        queues = [QUEUE_KEY, NER_QUEUE_KEY, RECOMPUTE_SILOS_QUEUE_KEY, COMPUTE_EMBEDDINGS_QUEUE_KEY, COMPUTE_OPPORTUNITIES_QUEUE_KEY]
-        logger.info("Worker Silo (mode full) démarré, écoute crawl + NER + silos + embeddings...")
+        queues = [QUEUE_KEY, NER_QUEUE_KEY, RECOMPUTE_SILOS_QUEUE_KEY, COMPUTE_EMBEDDINGS_QUEUE_KEY, COMPUTE_OPPORTUNITIES_QUEUE_KEY, DELETE_PROJECT_QUEUE_KEY]
+        logger.info("Worker Silo (mode full) démarré, écoute crawl + NER + silos + embeddings + delete...")
         _preload_nlp_models()
 
     while True:
@@ -147,6 +148,16 @@ def main():
                                     pass
                     continue
 
+                if queue_name == DELETE_PROJECT_QUEUE_KEY:
+                    project_id = data.get("project_id")
+                    if project_id:
+                        logger.info(f"Job suppression projet reçu: {project_id}")
+                        try:
+                            run_delete_project(project_id)
+                        except Exception as e:
+                            logger.exception(f"Erreur suppression projet {project_id}: {e}")
+                    continue
+
                 project_id = data.get("project_id")
                 seed_url = data.get("seed_url")
                 if project_id and seed_url:
@@ -161,10 +172,21 @@ def main():
                         max_depth = data.get("max_depth", 3)
                         max_pages = data.get("max_pages", 50)
                         run_ner = data.get("run_ner", True)
+                        path_prefix = data.get("path_prefix")
+                        exclude_urls_with_params = data.get("exclude_urls_with_params", True)
                         phase1_only = WORKER_MODE == "crawl" and run_ner
-                        logger.info(f"Job crawl reçu: {project_id} -> {seed_url} (depth={max_depth}, max={max_pages}, ner={run_ner}, phase1_only={phase1_only})")
+                        logger.info(f"Job crawl reçu: {project_id} -> {seed_url} (depth={max_depth}, max={max_pages}, ner={run_ner}, path_prefix={path_prefix}, exclude_params={exclude_urls_with_params}, phase1_only={phase1_only})")
                         try:
-                            run_crawl(project_id, seed_url, max_depth=max_depth, max_pages=max_pages, run_ner=run_ner, phase1_only=phase1_only)
+                            run_crawl(
+                                project_id,
+                                seed_url,
+                                max_depth=max_depth,
+                                max_pages=max_pages,
+                                run_ner=run_ner,
+                                phase1_only=phase1_only,
+                                path_prefix=path_prefix,
+                                exclude_urls_with_params=exclude_urls_with_params,
+                            )
                             if phase1_only and run_ner and not _check_stop(project_id):
                                 r.rpush(PHASE2_QUEUE_KEY, json.dumps({"project_id": project_id}))
                             # Throttle entre jobs pour éviter surcharge CPU (mode url_list = 1 job/URL)

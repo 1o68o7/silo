@@ -35,6 +35,9 @@ def get_engine():
         if not use_null_pool:
             kwargs["pool_size"] = POOL_SIZE
             kwargs["max_overflow"] = MAX_OVERFLOW
+        # Timeout requêtes longues (évite blocages, 5 min par défaut)
+        stmt_timeout_sec = int(os.environ.get("SILO_DB_STATEMENT_TIMEOUT", "300"))
+        kwargs["connect_args"] = {"options": f"-c statement_timeout={stmt_timeout_sec}s"}
         _engine = create_engine(DATABASE_URL, **kwargs)
     return _engine
 
@@ -52,6 +55,9 @@ def init_db(engine=None):
         conn.execute(text("SET lock_timeout = '5s'"))
         conn.execute(text(
             "ALTER TABLE pages ADD COLUMN IF NOT EXISTS excluded BOOLEAN DEFAULT FALSE"
+        ))
+        conn.execute(text(
+            "ALTER TABLE projects ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP"
         ))
         conn.commit()
     return eng

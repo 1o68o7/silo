@@ -1,6 +1,7 @@
 """
 Service layer - CRUD pour projets, pages, edges.
 """
+import os
 from datetime import datetime
 from typing import Optional
 import uuid
@@ -8,7 +9,7 @@ import uuid
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from .models import Project, Page, Edge, OpportunityRecord, ComputedOpportunity, EMBEDDING_DIM
+from .models import Project, Page, Edge, OpportunityRecord, ComputedOpportunity, CrawlQueue, EMBEDDING_DIM
 from .db import get_engine, get_session, init_db
 
 
@@ -22,7 +23,12 @@ def ensure_db():
 
 
 def list_projects(session: Session) -> list[dict]:
-    rows = session.query(Project).order_by(Project.created_at.desc()).all()
+    rows = (
+        session.query(Project)
+        .filter(Project.deleted_at.is_(None))
+        .order_by(Project.created_at.desc())
+        .all()
+    )
     return [
         {
             "id": p.id,
@@ -51,8 +57,11 @@ def create_project(session: Session, name: str, seed_url: str) -> dict:
     }
 
 
-def get_project(session: Session, project_id: str) -> Optional[Project]:
-    return session.query(Project).filter(Project.id == project_id).first()
+def get_project(session: Session, project_id: str, include_deleted: bool = False) -> Optional[Project]:
+    q = session.query(Project).filter(Project.id == project_id)
+    if not include_deleted:
+        q = q.filter(Project.deleted_at.is_(None))
+    return q.first()
 
 
 def get_graph(session: Session, project_id: str, include_excluded: bool = False) -> dict:
@@ -266,14 +275,96 @@ def update_project_status(session: Session, project_id: str, status: str, urls_c
         session.commit()
 
 
+# Taille des lots pour suppression (évite blocages longs, COMMIT intermédiaires)
+DELETE_BATCH_SIZE = int(os.environ.get("SILO_DELETE_BATCH_SIZE", "500"))
+
+
+def mark_project_deleted(session: Session, project_id: str) -> bool:
+    """
+    Soft delete : marque le projet comme supprimé immédiatement.
+    Utilisé avant enqueue async pour que GET /api/projects exclue le projet tout de suite.
+    """
+    updated = session.execute(
+        text("UPDATE projects SET deleted_at = NOW() WHERE id = :id AND deleted_at IS NULL"),
+        {"id": project_id},
+    )
+    session.commit()
+    return updated.rowcount > 0
+
+
 def delete_project(session: Session, project_id: str) -> bool:
-    """Supprime un projet et ses pages/edges (cascade)."""
-    p = get_project(session, project_id)
-    if p:
-        session.delete(p)
+    """
+    Supprime un projet et ses données par lots avec COMMIT intermédiaires.
+    Évite les blocages prolongés sur projets volumineux (10k+ edges).
+    Le worker utilise include_deleted=True pour retrouver les projets soft-deleted.
+    """
+    p = get_project(session, project_id, include_deleted=True)
+    if not p:
+        return False
+
+    # Ordre: tables dépendantes d'abord (FK vers pages)
+    # ComputedOpportunity par lots (peut être très volumineux)
+    while True:
+        batch = (
+            session.query(ComputedOpportunity.id)
+            .filter(ComputedOpportunity.project_id == project_id)
+            .limit(DELETE_BATCH_SIZE)
+            .all()
+        )
+        if not batch:
+            break
+        ids = [r[0] for r in batch]
+        session.query(ComputedOpportunity).filter(ComputedOpportunity.id.in_(ids)).delete(
+            synchronize_session=False
+        )
         session.commit()
-        return True
-    return False
+
+    session.query(OpportunityRecord).filter(
+        OpportunityRecord.project_id == project_id
+    ).delete(synchronize_session=False)
+    session.commit()
+
+    # Edges par lots (souvent le plus volumineux)
+    while True:
+        batch = (
+            session.query(Edge.id)
+            .filter(Edge.project_id == project_id)
+            .limit(DELETE_BATCH_SIZE)
+            .all()
+        )
+        if not batch:
+            break
+        ids = [r[0] for r in batch]
+        session.query(Edge).filter(Edge.id.in_(ids)).delete(synchronize_session=False)
+        session.commit()
+
+    session.query(CrawlQueue).filter(CrawlQueue.project_id == project_id).delete(
+        synchronize_session=False
+    )
+    session.commit()
+
+    # Pages par lots
+    while True:
+        batch = (
+            session.query(Page.id)
+            .filter(Page.project_id == project_id)
+            .limit(DELETE_BATCH_SIZE)
+            .all()
+        )
+        if not batch:
+            break
+        ids = [r[0] for r in batch]
+        session.query(Page).filter(Page.id.in_(ids)).delete(synchronize_session=False)
+        session.commit()
+
+    session.delete(p)
+    session.commit()
+    return True
+
+
+def count_project_edges(session: Session, project_id: str) -> int:
+    """Compte les edges d'un projet (pour décider sync vs async)."""
+    return session.query(Edge).filter(Edge.project_id == project_id).count()
 
 
 def get_embeddings_status(session: Session, project_id: str, page_id: str = None) -> dict:

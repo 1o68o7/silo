@@ -54,6 +54,49 @@ def should_exclude_from_crawl(url: str) -> bool:
     return url_has_query_params(url)
 
 
+# Codes langue supportés pour path_prefix (aligné avec get_theoretical_silo_from_url)
+LANG_CODES = frozenset({"fr", "en", "de", "it", "es", "nl", "pt"})
+
+
+def extract_lang_path_prefix(url: str) -> str | None:
+    """
+    Extrait le préfixe de chemin langue depuis l'URL si le premier segment est un code langue connu.
+    Ex: https://site.com/fr/accus/... -> "/fr"
+        https://site.com/en/page -> "/en"
+        https://site.com/page -> None
+    """
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or ""
+        segments = [s for s in path.split("/") if s]
+        if segments and segments[0].lower() in LANG_CODES:
+            return "/" + segments[0].lower()
+        return None
+    except Exception:
+        return None
+
+
+def url_matches_path_prefix(url: str, path_prefix: str | None) -> bool:
+    """
+    Vérifie si le path de l'URL commence par path_prefix.
+    - path_prefix None ou "" : pas de restriction (retourne True)
+    - path_prefix "/fr" : True si path commence par /fr (ex: /fr/accus/...)
+    """
+    if not path_prefix:
+        return True
+    try:
+        parsed = urlparse(url)
+        path = parsed.path or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        prefix = path_prefix if path_prefix.startswith("/") else "/" + path_prefix
+        return path == prefix or path.startswith(prefix + "/")
+    except Exception:
+        return False
+
+
 def get_theoretical_silo_from_url(url: str) -> str:
     """
     Extrait un "silo théorique" depuis l'URL (structure des chemins).
@@ -66,9 +109,8 @@ def get_theoretical_silo_from_url(url: str) -> str:
         parsed = urlparse(url)
         path = parsed.path or ""
         segments = [s for s in path.split("/") if s]
-        lang_codes = {"fr", "en", "de", "it", "es", "nl", "pt"}
         for s in segments:
-            if s.lower() not in lang_codes and len(s) > 1:
+            if s.lower() not in LANG_CODES and len(s) > 1:
                 return s
         return "racine" if segments else "default"
     except Exception:
