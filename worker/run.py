@@ -98,7 +98,14 @@ def main():
                             node_id = data.get("node_id")
                             silo_id = data.get("silo_id")
                             logger.info(f"Job NER reçu: {project_id} node={node_id} silo={silo_id}")
-                            run_ner_on_demand(project_id, node_id=node_id, silo_id=silo_id)
+                            try:
+                                r.set(f"silo:ner_in_progress:{project_id}", "1", ex=7200)
+                                run_ner_on_demand(project_id, node_id=node_id, silo_id=silo_id)
+                            finally:
+                                try:
+                                    r.delete(f"silo:ner_in_progress:{project_id}")
+                                except Exception:
+                                    pass
                     continue
 
                 if queue_name == RECOMPUTE_SILOS_QUEUE_KEY:
@@ -108,7 +115,15 @@ def main():
                             logger.info(f"Job recalcul silos ignoré (stop demandé): {project_id}")
                         else:
                             logger.info(f"Job recalcul silos reçu: {project_id}")
-                            recompute_silos(project_id)
+                            try:
+                                r.set(f"silo:recompute_in_progress:{project_id}", "1", ex=3600)
+                                recompute_silos(project_id)
+                            finally:
+                                try:
+                                    r.delete(f"silo:recompute_in_progress:{project_id}")
+                                    r.delete(f"silo:recompute_progress:{project_id}")
+                                except Exception:
+                                    pass
                     continue
 
                 if queue_name == COMPUTE_EMBEDDINGS_QUEUE_KEY:
@@ -120,12 +135,14 @@ def main():
                             page_id = data.get("page_id")
                             logger.info(f"Job compute embeddings reçu: {project_id}" + (f" page={page_id}" if page_id else ""))
                             try:
+                                r.set(f"silo:embedding_in_progress:{project_id}", "1", ex=7200)
                                 run_compute_embeddings(project_id, page_id=page_id)
                             except Exception as e:
                                 logger.exception(f"Erreur compute embeddings {project_id}: {e}")
                             finally:
                                 try:
                                     r.delete(f"silo:embedding_in_progress:{project_id}")
+                                    r.delete(f"silo:embedding_progress:{project_id}")
                                 except Exception:
                                     pass
                     continue

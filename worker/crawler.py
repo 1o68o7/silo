@@ -6,6 +6,7 @@ Architecture en 2 phases:
 Stack: Scrapling (StealthyFetcher) + Trafilatura + FastEmbed + spaCy + CDlib.
 Reasonable Surfer: poids positionnel, similarité sémantique, bonus ancre NER.
 """
+import gc
 import os
 import re
 import hashlib
@@ -28,9 +29,12 @@ logger = logging.getLogger("silo-worker")
 
 # Singleton FastEmbed pour éviter rechargements et fuites mémoire
 _embedding_model = None
-EMBEDDING_BATCH_SIZE = int(os.environ.get("SILO_EMBEDDING_BATCH_SIZE", "64"))
+# e5-large (~2.2 Go) : batch 16 pour éviter OOM. e5-small : 64 OK.
+EMBEDDING_BATCH_SIZE = int(os.environ.get("SILO_EMBEDDING_BATCH_SIZE", "16"))
 # Taille des lots DB : évite "named cursor isn't valid anymore" (connexion tenue trop longtemps)
 DB_CHUNK_SIZE = 200
+# Chunk spécifique embeddings (moins de pages par session = moins de RAM)
+EMBEDDING_DB_CHUNK = int(os.environ.get("SILO_EMBEDDING_DB_CHUNK", "50"))
 # Phase 1: batch commits (réduit round-trips DB)
 PHASE1_BATCH_COMMIT = int(os.environ.get("SILO_PHASE1_BATCH_COMMIT", "5"))
 # Phase 1: fetch parallèle (0 = désactivé)
@@ -633,6 +637,20 @@ def run_compute_embeddings(project_id: str, page_id: str = None):
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
 
+    def _process_batch(session, batch_pages, model):
+        """Traite un batch de pages. Retourne nb traité. Lève en cas d'erreur."""
+        if not batch_pages:
+            return 0
+        texts = [(x.content_text or "")[:EMBEDDING_TEXT_MAX_CHARS] for x in batch_pages]
+        embs = _embed_texts(model, texts)
+        entities_list = extract_entities_batch(texts)
+        for pg, emb, entities in zip(batch_pages, embs, entities_list):
+            pg.entities = entities
+            pg.embedding = emb.tolist() if hasattr(emb, "tolist") else list(emb)
+            _push_log(project_id, "info", f"Embed: {pg.url[:50]}...", url=pg.url)
+        session.commit()
+        return len(batch_pages)
+
     def _process_chunk(session, pages, model):
         processed = 0
         batch_acc = []
@@ -642,28 +660,36 @@ def run_compute_embeddings(project_id: str, page_id: str = None):
                 continue
             batch_acc.append(p)
             if len(batch_acc) >= EMBEDDING_BATCH_SIZE:
-                texts = [(x.content_text or "")[:EMBEDDING_TEXT_MAX_CHARS] for x in batch_acc]
-                embs = _embed_texts(model, texts)
-                entities_list = extract_entities_batch(texts)
-                for pg, emb, entities in zip(batch_acc, embs, entities_list):
-                    pg.entities = entities
-                    pg.embedding = emb.tolist() if hasattr(emb, "tolist") else list(emb)
-                    _push_log(project_id, "info", f"Embed: {pg.url[:50]}...", url=pg.url)
-                    processed += 1
-                session.commit()
-                logger.info(f"[Embeddings] Batch {len(batch_acc)} pages → {processed} cumul")
+                try:
+                    processed += _process_batch(session, batch_acc, model)
+                    logger.info(f"[Embeddings] Batch {len(batch_acc)} pages → {processed} cumul")
+                except Exception as e:
+                    session.rollback()
+                    logger.warning(f"[Embeddings] Batch {len(batch_acc)} échoué: {e}, fallback 1 par 1")
+                    for pg in batch_acc:
+                        try:
+                            pg_refresh = session.query(Page).filter(Page.id == pg.id).first()
+                            if pg_refresh and pg_refresh.embedding is None:
+                                _process_batch(session, [pg_refresh], model)
+                                processed += 1
+                        except Exception as e2:
+                            logger.warning(f"[Embeddings] Page {pg.id} ignorée: {e2}")
                 batch_acc = []
         if batch_acc:
-            texts = [(x.content_text or "")[:EMBEDDING_TEXT_MAX_CHARS] for x in batch_acc]
-            embs = _embed_texts(model, texts)
-            entities_list = extract_entities_batch(texts)
-            for pg, emb, entities in zip(batch_acc, embs, entities_list):
-                pg.entities = entities
-                pg.embedding = emb.tolist() if hasattr(emb, "tolist") else list(emb)
-                _push_log(project_id, "info", f"Embed: {pg.url[:50]}...", url=pg.url)
-                processed += 1
-            session.commit()
-            logger.info(f"[Embeddings] Batch final {len(batch_acc)} pages → {processed} cumul")
+            try:
+                processed += _process_batch(session, batch_acc, model)
+                logger.info(f"[Embeddings] Batch final {len(batch_acc)} pages → {processed} cumul")
+            except Exception as e:
+                session.rollback()
+                logger.warning(f"[Embeddings] Batch final échoué: {e}, fallback 1 par 1")
+                for pg in batch_acc:
+                    try:
+                        pg_refresh = session.query(Page).filter(Page.id == pg.id).first()
+                        if pg_refresh and pg_refresh.embedding is None:
+                            _process_batch(session, [pg_refresh], model)
+                            processed += 1
+                    except Exception as e2:
+                        logger.warning(f"[Embeddings] Page {pg.id} ignorée: {e2}")
         return processed
 
     session = Session()
@@ -699,13 +725,29 @@ def run_compute_embeddings(project_id: str, page_id: str = None):
             )
             if page_id:
                 query = query.filter(Page.id == page_id)
-            pages = query.limit(DB_CHUNK_SIZE).all()
+            pages = query.limit(EMBEDDING_DB_CHUNK).all()
             if not pages:
                 break
             chunk_num += 1
             n_before = total_processed
             total_processed += _process_chunk(session, pages, model)
             logger.info(f"[Embeddings] Lot {chunk_num}: {total_processed - n_before} page(s) → total {total_processed}")
+            gc.collect()  # Libérer mémoire entre chunks (e5-large ~2.2 Go)
+            # Progression Redis pour affichage temps réel (embeddings-status peut lire)
+            try:
+                total_pages = session.query(Page).filter(Page.project_id == project_id).count()
+                with_emb = session.query(Page).filter(
+                    Page.project_id == project_id,
+                    Page.embedding.isnot(None),
+                ).count()
+                r = redis.from_url(REDIS_URL)
+                r.set(
+                    f"silo:embedding_progress:{project_id}",
+                    json.dumps({"pages_with_embedding": with_emb, "total_pages": total_pages}),
+                    ex=7200,
+                )
+            except Exception:
+                pass
         except Exception as e:
             logger.exception(e)
             session.rollback()
@@ -821,8 +863,28 @@ def recompute_silos(project_id: str):
             return
         import cdlib
         from cdlib import algorithms
+        total_edges = len(edges)
+        total_nodes = G.number_of_nodes()
+
+        def _update_progress(nodes_processed: int):
+            try:
+                r = redis.from_url(REDIS_URL)
+                r.set(
+                    f"silo:recompute_progress:{project_id}",
+                    json.dumps({
+                        "total_edges": total_edges,
+                        "edges_processed": nodes_processed,
+                        "total_nodes": total_nodes,
+                    }),
+                    ex=3600,
+                )
+            except Exception:
+                pass
+
+        _update_progress(0)
         G_undir = G.to_undirected()
         coms = algorithms.louvain(G_undir)
+        nodes_processed = 0
         for i, community in enumerate(coms.communities):
             if _check_stop(project_id):
                 _push_log(project_id, "info", "Recalcul silos stoppé par l'utilisateur")
@@ -832,6 +894,9 @@ def recompute_silos(project_id: str):
                 p = session.query(Page).filter(Page.id == nid, Page.project_id == project_id).first()
                 if p:
                     p.silo_id = str(i)
+                nodes_processed += 1
+            if nodes_processed % 500 == 0 or nodes_processed == total_nodes:
+                _update_progress(nodes_processed)
         session.commit()
         _push_log(project_id, "info", f"Recalcul silos: {len(coms.communities)} communauté(s) identifiée(s)")
     except Exception as e:

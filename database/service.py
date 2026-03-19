@@ -116,6 +116,166 @@ def get_graph(session: Session, project_id: str, include_excluded: bool = False)
     return {"nodes": nodes, "edges": edges_data, "excluded_count": excluded_count}
 
 
+def get_graph_directory_tree(session: Session, project_id: str, include_excluded: bool = False) -> dict:
+    """
+    Construit le graphe arborescence de répertoires à partir des URLs du projet.
+    Nodes = segments de chemin (répertoires virtuels) + pages terminales.
+    Edges = parent → enfant dans le chemin.
+    Brief: BRIEF_SILO_VUE_ARBORESCENCE_REPERTOIRES_2026-03-19.
+    """
+    from urllib.parse import urlparse
+    from worker.url_utils import url_has_query_params
+
+    pages = session.query(Page).filter(Page.project_id == project_id).all()
+    excluded_ids = {
+        p.id for p in pages
+        if getattr(p, "excluded", False) or url_has_query_params(p.url) or "?" in (p.url or "")
+    }
+    excluded_count = len(excluded_ids)
+
+    if not include_excluded:
+        pages_filtered = [p for p in pages if p.id not in excluded_ids]
+    else:
+        pages_filtered = pages
+
+    # path (canonical, sans query) -> liste des pages à ce path (une seule en pratique après dédup)
+    path_to_pages: dict[str, list] = {}
+    for p in pages_filtered:
+        parsed = urlparse(p.url or "")
+        path = (parsed.path or "").strip() or "/"
+        if not path.startswith("/"):
+            path = "/" + path
+        if path not in path_to_pages:
+            path_to_pages[path] = []
+        path_to_pages[path].append(p)
+
+    # Tous les chemins (prefixes + feuilles)
+    all_paths: set[str] = set()
+    for path in path_to_pages:
+        # Ajouter tous les préfixes: /fr/blog/page -> /, /fr, /fr/blog, /fr/blog/page
+        parts = [s for s in path.split("/") if s]
+        for i in range(len(parts) + 1):
+            prefix = "/" + "/".join(parts[:i]) if i > 0 else "/"
+            all_paths.add(prefix)
+
+    # Construire les nodes
+    nodes: list[dict] = []
+    node_ids: set[str] = set()
+
+    # Compter les enfants par path (direct children)
+    children_count: dict[str, int] = {}
+    for path in all_paths:
+        # Enfants directs = paths qui commencent par path/ et n'ont pas de segment en plus (sauf un)
+        parts = [s for s in path.split("/") if s]
+        depth = len(parts)
+        count = 0
+        for other in all_paths:
+            other_parts = [s for s in other.split("/") if s]
+            if len(other_parts) == depth + 1:
+                parent = "/" + "/".join(other_parts[:-1]) if other_parts[:-1] else "/"
+                if parent == path:
+                    count += 1
+        children_count[path] = count
+
+    # indexable_count et non_indexable_count par path (récursif: ce nœud + sous-arbre)
+    def count_indexable(p: str) -> tuple[int, int]:
+        idx, nidx = 0, 0
+        for page in path_to_pages.get(p, []):
+            if page.id in excluded_ids:
+                nidx += 1
+            else:
+                idx += 1
+        for other in all_paths:
+            if other == p:
+                continue
+            o_parts = [s for s in other.split("/") if s]
+            parent_of_other = "/" + "/".join(o_parts[:-1]) if len(o_parts) > 1 else "/"
+            if parent_of_other == p:
+                oi, oni = count_indexable(other)
+                idx += oi
+                nidx += oni
+        return idx, nidx
+
+    for path in sorted(all_paths, key=lambda x: (x.count("/"), x)):
+        pages_at_path = path_to_pages.get(path, [])
+        is_terminal = len(pages_at_path) > 0
+        idx_count, nidx_count = count_indexable(path)
+
+        if is_terminal:
+            # Une page à ce path: nœud terminal (on prend la première page)
+            pg = pages_at_path[0]
+            nodes.append({
+                "id": f"page:{pg.id}",
+                "path": path,
+                "path_depth": len([s for s in path.split("/") if s]),
+                "is_terminal": True,
+                "url": pg.url,
+                "page_id": pg.id,
+                "children_count": children_count.get(path, 0),
+                "indexable_count": idx_count,
+                "non_indexable_count": nidx_count,
+                "excluded": pg.id in excluded_ids,
+                "title": pg.title,
+                "depth": pg.depth,
+            })
+            node_ids.add(f"page:{pg.id}")
+        else:
+            # Répertoire virtuel
+            path_id = f"path:{path}" if path != "/" else "path:/"
+            nodes.append({
+                "id": path_id,
+                "path": path,
+                "path_depth": len([s for s in path.split("/") if s]),
+                "is_terminal": False,
+                "url": None,
+                "page_id": None,
+                "children_count": children_count.get(path, 0),
+                "indexable_count": idx_count,
+                "non_indexable_count": nidx_count,
+                "excluded": False,
+                "title": None,
+                "depth": None,
+            })
+            node_ids.add(path_id)
+
+    # Toujours créer le nœud racine path:/ si on a des données
+    if all_paths and "path:/" not in node_ids:
+        root_idx, root_nidx = count_indexable("/")
+        root_children = sum(1 for p in all_paths if p != "/" and len([s for s in p.split("/") if s]) == 1)
+        nodes.insert(0, {
+            "id": "path:/",
+            "path": "/",
+            "path_depth": 0,
+            "is_terminal": False,
+            "url": None,
+            "page_id": None,
+            "children_count": root_children,
+            "indexable_count": root_idx,
+            "non_indexable_count": root_nidx,
+            "excluded": False,
+            "title": None,
+            "depth": None,
+        })
+        node_ids.add("path:/")
+
+    # Construire les edges: parent -> enfant
+    edges_data: list[dict] = []
+    for path in all_paths:
+        parts = [s for s in path.split("/") if s]
+        parent_path = "/" + "/".join(parts[:-1]) if len(parts) > 1 else "/"
+        if path == "/":
+            continue  # pas d'arête pour la racine
+        source_id = "path:/" if parent_path == "/" else f"path:{parent_path}"
+        if path in path_to_pages:
+            target_id = f"page:{path_to_pages[path][0].id}"
+        else:
+            target_id = f"path:{path}"
+        if source_id in node_ids and target_id in node_ids:
+            edges_data.append({"source": source_id, "target": target_id})
+
+    return {"nodes": nodes, "edges": edges_data, "excluded_count": excluded_count}
+
+
 def get_silo_analysis(session: Session, project_id: str) -> Optional[dict]:
     """
     Analyse silos théorique vs réel (Phase 6).

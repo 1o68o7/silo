@@ -50,12 +50,41 @@ class GraphData(BaseModel):
     excluded_count: int = 0  # Nombre de pages exclues (URLs avec paramètres)
 
 
+class DirectoryTreeNode(BaseModel):
+    """Nœud du graphe arborescence de répertoires (BRIEF_SILO_VUE_ARBORESCENCE_REPERTOIRES_2026-03-19)."""
+    id: str
+    path: str
+    path_depth: int
+    is_terminal: bool
+    url: Optional[str] = None
+    page_id: Optional[str] = None
+    children_count: int = 0
+    indexable_count: int = 0
+    non_indexable_count: int = 0
+    excluded: bool = False
+    title: Optional[str] = None
+    depth: Optional[int] = None
+
+
+class DirectoryTreeEdge(BaseModel):
+    source: str
+    target: str
+
+
+class DirectoryTreeData(BaseModel):
+    nodes: list[DirectoryTreeNode]
+    edges: list[DirectoryTreeEdge]
+    excluded_count: int = 0
+
+
 class CrawlStatus(BaseModel):
+    """Réponse GET /api/projects/{id}/crawl-status — progression fiable (BRIEF crawl-status enrichi mars 2026)."""
     project_id: str
-    status: str
+    status: str  # crawling | done | paused | stopped | idle | error
     urls_discovered: int = 0
     urls_processed: int = 0
-    progress_percent: float = 0.0
+    urls_total: Optional[int] = None  # Mode url_list: len(url_list). Mode seed_url: null.
+    progress_percent: Optional[float] = None  # Fiable si urls_total défini ; sinon estimation ou null
     message: Optional[str] = None
 
 
@@ -67,6 +96,12 @@ class CrawlConfig(BaseModel):
     url_list: Optional[List[str]] = None  # Liste d'URLs à crawler (uniquement ces URLs, max_depth=0)
     path_prefix: Optional[str] = None  # Borne le crawl au répertoire (ex. /fr). "" ou null = pas de restriction
     exclude_urls_with_params: bool = True  # Exclure les URLs avec query string (pagination, utm_*, etc.)
+
+
+class CrawlConfigResponse(BaseModel):
+    """Réponse GET /api/config — options dynamiques pour le formulaire de crawl (BRIEF_BACKEND_SILO_GET_API_CONFIG_2026-03-19)."""
+    path_prefix_options: list[str]
+    default_exclude_urls_with_params: bool = True
 
 
 # Store en mémoire (fallback si pas de DB)
@@ -115,6 +150,7 @@ def _init_memory_demo():
         status="done",
         urls_discovered=3,
         urls_processed=3,
+        urls_total=3,
         progress_percent=100.0,
     )
 
@@ -144,6 +180,8 @@ app.add_middleware(
     allow_origins=[
         "https://www.log8ot.com",
         "https://log8ot.com",
+        "https://app.log8ot.com",
+        "https://dev.log8ot.com",
         "http://localhost:3000",
         "http://localhost:3001",
     ],
@@ -191,6 +229,38 @@ async def get_long_queries(min_duration_sec: int = 30):
             session.close()
     except Exception as e:
         return {"queries": [], "count": 0, "error": str(e)}
+
+
+# Configuration crawl dynamique (path_prefix_options, etc.) — BRIEF_BACKEND_SILO_GET_API_CONFIG_2026-03-19
+DEFAULT_PATH_PREFIX_OPTIONS = ["fr", "en", "de", "it", "es", "nl", "pt"]
+
+
+def _get_path_prefix_options() -> list[str]:
+    """Codes de répertoire de langue supportés (sans slash). Configurable via SILO_PATH_PREFIX_OPTIONS."""
+    raw = os.getenv("SILO_PATH_PREFIX_OPTIONS", "fr,en,de,it,es,nl,pt")
+    options = [s.strip().lstrip("/") for s in raw.split(",") if s.strip()]
+    # Validation : 2–5 caractères (codes ISO 639-1)
+    valid = [o for o in options if 2 <= len(o) <= 5]
+    return valid if valid else DEFAULT_PATH_PREFIX_OPTIONS
+
+
+def _get_default_exclude_urls_with_params() -> bool:
+    """Valeur par défaut du toggle « Exclure les URLs avec paramètres ». Configurable via SILO_DEFAULT_EXCLUDE_URLS_WITH_PARAMS."""
+    return os.getenv("SILO_DEFAULT_EXCLUDE_URLS_WITH_PARAMS", "true").lower() == "true"
+
+
+@app.get("/api/config", response_model=CrawlConfigResponse)
+async def get_crawl_config():
+    """
+    Configuration pour le formulaire de crawl (options path_prefix dynamiques).
+    Le frontend utilise ces valeurs pour le select « Répertoire de langue ».
+    Sans authentification (données non sensibles).
+    Configurable via SILO_PATH_PREFIX_OPTIONS et SILO_DEFAULT_EXCLUDE_URLS_WITH_PARAMS.
+    """
+    return CrawlConfigResponse(
+        path_prefix_options=_get_path_prefix_options(),
+        default_exclude_urls_with_params=_get_default_exclude_urls_with_params(),
+    )
 
 
 @app.get("/api/projects", response_model=list[Project])
@@ -292,9 +362,62 @@ async def get_graph(project_id: str, include_excluded: bool = False):
     return _graph_cache[project_id]
 
 
+@app.get("/api/projects/{project_id}/graph-directory-tree", response_model=DirectoryTreeData)
+async def get_graph_directory_tree(project_id: str, include_excluded: bool = False):
+    """
+    Graphe arborescence de répertoires (structure URL). Par défaut exclut les URLs avec paramètres.
+    ?include_excluded=true pour les inclure.
+    Brief: BRIEF_SILO_VUE_ARBORESCENCE_REPERTOIRES_2026-03-19.
+    """
+    if USE_DB:
+        try:
+            from database.db import get_session
+            from database.service import get_graph_directory_tree as db_dir_tree, get_project
+            session = get_session()
+            try:
+                if not get_project(session, project_id):
+                    raise HTTPException(status_code=404, detail="Projet non trouvé")
+                g = db_dir_tree(session, project_id, include_excluded=include_excluded)
+                return DirectoryTreeData(**g)
+            finally:
+                session.close()
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+    if project_id in _projects:
+        return DirectoryTreeData(nodes=[], edges=[], excluded_count=0)
+    raise HTTPException(status_code=404, detail="Projet non trouvé")
+
+
 CRAWL_LOGS_KEY = "silo:crawl_logs"
 CRAWL_PAUSE_KEY = "silo:crawl_pause"
 CRAWL_STOP_KEY = "silo:crawl_stop"
+CRAWL_URLS_TOTAL_KEY = "silo:crawl_urls_total"  # Mode url_list: total connu dès le début
+
+
+def _get_crawl_urls_total(project_id: str) -> Optional[int]:
+    """Récupère urls_total depuis Redis (mode url_list). Retourne None si absent."""
+    r = _get_redis()
+    if not r:
+        return None
+    try:
+        val = r.get(f"{CRAWL_URLS_TOTAL_KEY}:{project_id}")
+        if val is not None:
+            return int(val)
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _set_crawl_urls_total(project_id: str, total: int):
+    """Stocke urls_total dans Redis (mode url_list). TTL 7 jours."""
+    r = _get_redis()
+    if r and total > 0:
+        try:
+            r.set(f"{CRAWL_URLS_TOTAL_KEY}:{project_id}", str(total), ex=604800)
+        except Exception:
+            pass
 
 
 def _get_crawl_logs(project_id: str) -> list[dict]:
@@ -332,8 +455,54 @@ async def get_crawl_logs(project_id: str):
     return {"logs": _get_crawl_logs(project_id)}
 
 
+def _build_crawl_status_enriched(project_id: str, s: dict) -> CrawlStatus:
+    """
+    Enrichit la réponse crawl-status avec urls_total (Redis) et progress_percent fiable.
+    Brief: progression fiable pour mode url_list (recrawl) et seed_url (découverte).
+    """
+    urls_total = _get_crawl_urls_total(project_id)
+    urls_processed = s.get("urls_processed", 0) or 0
+    status = s.get("status") or "idle"
+
+    if urls_total is not None:
+        urls_discovered = urls_total
+        if status == "done":
+            progress_percent = 100.0
+        elif urls_total > 0:
+            pct = urls_processed / urls_total * 100
+            progress_percent = min(100.0, round(pct))
+        else:
+            progress_percent = 0
+    else:
+        # Mode seed_url : total inconnu. urls_discovered = max(DB, processed) pour affichage.
+        urls_discovered = max(
+            s.get("urls_discovered", 0) or 0,
+            urls_processed,
+        )
+        if status == "done":
+            progress_percent = 100.0
+        else:
+            # Total inconnu en mode seed_url → progression non fiable (évite 526300% si urls_discovered=1)
+            progress_percent = None
+
+    return CrawlStatus(
+        project_id=project_id,
+        status=status,
+        urls_discovered=urls_discovered,
+        urls_processed=urls_processed,
+        urls_total=urls_total,
+        progress_percent=progress_percent,
+        message=s.get("message"),
+    )
+
+
 @app.get("/api/projects/{project_id}/crawl-status", response_model=CrawlStatus)
 async def get_crawl_status(project_id: str):
+    """
+    Statut du crawl avec progression fiable.
+    urls_total: défini en mode url_list (recrawl), null en mode seed_url.
+    progress_percent: fiable quand urls_total défini ; sinon estimation ou null.
+    """
     if USE_DB:
         try:
             from database.db import get_session
@@ -343,7 +512,8 @@ async def get_crawl_status(project_id: str):
                 if not get_project(session, project_id):
                     raise HTTPException(status_code=404, detail="Projet non trouvé")
                 s = db_status(session, project_id)
-                return CrawlStatus(**s)
+                if s:
+                    return _build_crawl_status_enriched(project_id, s)
             finally:
                 session.close()
         except HTTPException:
@@ -451,12 +621,14 @@ async def start_crawl(project_id: str, config: Optional[CrawlConfig] = Body(defa
         path_prefix = None
 
     r = _get_redis()
+    urls_total_for_status = None
     if r:
         try:
             r.delete(f"{CRAWL_PAUSE_KEY}:{project_id}", f"{CRAWL_STOP_KEY}:{project_id}")
             if cfg.url_list and len(cfg.url_list) > 0:
                 # Mode batch: une job par URL (crawl uniquement ces URLs, pas de suivi des liens)
                 from urllib.parse import urlparse
+                valid_count = 0
                 for u in cfg.url_list:
                     u = (u or "").strip()
                     if not u or not u.startswith(("http://", "https://")):
@@ -473,6 +645,9 @@ async def start_crawl(project_id: str, config: Optional[CrawlConfig] = Body(defa
                         "exclude_urls_with_params": cfg.exclude_urls_with_params,
                     }
                     r.rpush(QUEUE_KEY, json.dumps(payload))
+                    valid_count += 1
+                urls_total_for_status = valid_count
+                _set_crawl_urls_total(project_id, valid_count)
             else:
                 payload = {
                     "project_id": project_id,
@@ -503,9 +678,10 @@ async def start_crawl(project_id: str, config: Optional[CrawlConfig] = Body(defa
         _crawl_status[project_id] = CrawlStatus(
             project_id=project_id,
             status="crawling",
-            urls_discovered=0,
+            urls_discovered=urls_total_for_status or 0,
             urls_processed=0,
-            progress_percent=0.0,
+            urls_total=urls_total_for_status,
+            progress_percent=0.0 if urls_total_for_status else None,
             message="Crawl en attente (worker à connecter)" if not r else "Crawl en cours",
         )
 
@@ -625,6 +801,8 @@ async def run_ner_on_demand_endpoint(project_id: str, body: Optional[NerRequest]
 
 
 RECOMPUTE_SILOS_QUEUE_KEY = "silo:recompute_silos_queue"
+NER_IN_PROGRESS_KEY = "silo:ner_in_progress"
+RECOMPUTE_IN_PROGRESS_KEY = "silo:recompute_in_progress"
 
 
 @app.post("/api/projects/{project_id}/recompute-silos")
@@ -652,10 +830,63 @@ async def recompute_silos_endpoint(project_id: str):
         r = redis.from_url(REDIS_URL)
         if r:
             r.delete(f"{CRAWL_STOP_KEY}:{project_id}")  # Réinitialiser le stop pour le nouveau run
+            if r.exists(f"{RECOMPUTE_IN_PROGRESS_KEY}:{project_id}"):
+                raise HTTPException(status_code=409, detail="Un recalcul des silos est déjà en cours pour ce projet")
         r.rpush(RECOMPUTE_SILOS_QUEUE_KEY, json.dumps({"project_id": project_id}))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Impossible de lancer: {e}")
     return {"ok": True, "message": "Recalcul des silos lancé (traitement en cours)"}
+
+
+@app.get("/api/projects/{project_id}/recompute-silos-status")
+async def get_recompute_silos_status_endpoint(project_id: str):
+    """Statut du recalcul des silos (Louvain) — progression ou indicateur en cours."""
+    if USE_DB:
+        try:
+            from database.db import get_session
+            from database.service import get_project
+            session = get_session()
+            try:
+                if not get_project(session, project_id):
+                    raise HTTPException(status_code=404, detail="Projet non trouvé")
+            finally:
+                session.close()
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=500, detail="Erreur vérification projet")
+    try:
+        import redis
+        r = redis.from_url(REDIS_URL)
+        if r:
+            in_progress = bool(r.exists(f"{RECOMPUTE_IN_PROGRESS_KEY}:{project_id}"))
+            result = {"recompute_in_progress": in_progress}
+            if in_progress:
+                progress_data = r.get(f"silo:recompute_progress:{project_id}")
+                if progress_data:
+                    try:
+                        data = json.loads(progress_data)
+                        result["total_edges"] = data.get("total_edges")
+                        result["edges_processed"] = data.get("edges_processed")
+                        total = data.get("total_nodes") or data.get("total_edges") or 0
+                        processed = data.get("edges_processed") or 0
+                        result["progress_percent"] = round(100 * processed / total) if total > 0 else None
+                    except (json.JSONDecodeError, TypeError):
+                        result["progress_percent"] = None
+                else:
+                    result["total_edges"] = None
+                    result["edges_processed"] = None
+                    result["progress_percent"] = None
+            else:
+                result["total_edges"] = None
+                result["edges_processed"] = None
+                result["progress_percent"] = None
+            return result
+    except Exception:
+        pass
+    return {"recompute_in_progress": False, "total_edges": None, "edges_processed": None, "progress_percent": None}
 
 
 @app.get("/api/projects/{project_id}/embeddings-status")
@@ -676,6 +907,17 @@ async def get_embeddings_status_endpoint(project_id: str, page_id: str = None):
                     r = redis.from_url(REDIS_URL)
                     if r:
                         result["embedding_in_progress"] = bool(r.exists(f"{EMBEDDING_IN_PROGRESS_KEY}:{project_id}"))
+                        # Progression temps réel si job en cours (Option B du brief)
+                        if result["embedding_in_progress"]:
+                            progress_data = r.get(f"silo:embedding_progress:{project_id}")
+                            if progress_data:
+                                try:
+                                    data = json.loads(progress_data)
+                                    result["pages_with_embedding"] = data.get("pages_with_embedding", result["pages_with_embedding"])
+                                    result["total_pages"] = data.get("total_pages", result["total_pages"])
+                                    result["has_embeddings"] = result["pages_with_embedding"] > 0
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
                     else:
                         result["embedding_in_progress"] = False
                 except Exception:
@@ -701,14 +943,25 @@ async def get_ner_status_endpoint(project_id: str):
             try:
                 if not get_project(session, project_id):
                     raise HTTPException(status_code=404, detail="Projet non trouvé")
-                return get_ner_status(session, project_id)
+                result = get_ner_status(session, project_id)
+                # Indicateur backend : job NER en cours (verrou Redis)
+                try:
+                    import redis
+                    r = redis.from_url(REDIS_URL)
+                    if r:
+                        result["ner_in_progress"] = bool(r.exists(f"{NER_IN_PROGRESS_KEY}:{project_id}"))
+                    else:
+                        result["ner_in_progress"] = False
+                except Exception:
+                    result["ner_in_progress"] = False
+                return result
             finally:
                 session.close()
         except HTTPException:
             raise
         except Exception:
             raise HTTPException(status_code=500, detail="Erreur statut NER")
-    return {"total_pages": 0, "pages_with_entities": 0}
+    return {"total_pages": 0, "pages_with_entities": 0, "ner_in_progress": False}
 
 
 COMPUTE_EMBEDDINGS_QUEUE_KEY = "silo:compute_embeddings_queue"
