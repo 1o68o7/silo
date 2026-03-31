@@ -5,15 +5,50 @@ API FastAPI pour le graphe sémantique, projets et statut du crawler.
 import os
 import json
 import uuid
+import time
+import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException, Body, Depends, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
+import jwt as pyjwt
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6380/0")
+# Une seule source de vérité (évite l'écrasement ultérieur par `os.environ.get("REDIS_URL")` sans défaut).
+REDIS_URL = os.environ.get("REDIS_URL") or "redis://localhost:6380/0"
 NER_QUEUE_KEY = "silo:ner_queue"
+
+# ============================================================================
+# AUTHENTIFICATION JWT
+# ============================================================================
+
+_SILO_JWT_SECRET = os.environ.get("JWT_SECRET") or os.environ.get("JWT_SECRET_KEY", "")
+_SILO_JWT_ALGORITHM = "HS256"
+_SILO_REQUIRE_AUTH = os.environ.get("SILO_REQUIRE_AUTH", "true").lower() == "true"
+
+_bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def require_auth(credentials: Optional[HTTPAuthorizationCredentials] = Security(_bearer_scheme)) -> str:
+    """Valide le JWT et retourne le user_id. Lève 401 si invalide."""
+    if not _SILO_REQUIRE_AUTH:
+        return "anonymous"
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Token d'authentification requis")
+    if not _SILO_JWT_SECRET:
+        raise HTTPException(status_code=500, detail="JWT_SECRET_KEY non configuré sur le serveur")
+    try:
+        payload = pyjwt.decode(credentials.credentials, _SILO_JWT_SECRET, algorithms=[_SILO_JWT_ALGORITHM])
+        user_id: str = payload.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Token invalide : user_id manquant")
+        return user_id
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expiré")
+    except pyjwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Token invalide")
 
 # Modèles Pydantic pour l'API
 class Project(BaseModel):
@@ -88,6 +123,27 @@ class CrawlStatus(BaseModel):
     message: Optional[str] = None
 
 
+class FetchModeOption(BaseModel):
+    value: bool
+    label_key: str
+    description_key: str
+
+
+def _default_fetch_mode_options() -> list[FetchModeOption]:
+    return [
+        FetchModeOption(
+            value=True,
+            label_key="crawl.fetch.stealthy",
+            description_key="crawl.fetch.stealthy.help",
+        ),
+        FetchModeOption(
+            value=False,
+            label_key="crawl.fetch.http",
+            description_key="crawl.fetch.http.help",
+        ),
+    ]
+
+
 class CrawlConfig(BaseModel):
     max_depth: int = 3
     max_pages: int = 50
@@ -96,12 +152,23 @@ class CrawlConfig(BaseModel):
     url_list: Optional[List[str]] = None  # Liste d'URLs à crawler (uniquement ces URLs, max_depth=0)
     path_prefix: Optional[str] = None  # Borne le crawl au répertoire (ex. /fr). "" ou null = pas de restriction
     exclude_urls_with_params: bool = True  # Exclure les URLs avec query string (pagination, utm_*, etc.)
+    # null/absent : pas d'alignement worker ; true/false : garantir ce mode avant enqueue (brief 2026-03-30)
+    use_stealthy_fetcher: Optional[bool] = None
 
 
 class CrawlConfigResponse(BaseModel):
     """Réponse GET /api/config — options dynamiques pour le formulaire de crawl (BRIEF_BACKEND_SILO_GET_API_CONFIG_2026-03-19)."""
     path_prefix_options: list[str]
     default_exclude_urls_with_params: bool = True
+    fetch_mode_options: list[FetchModeOption] = Field(default_factory=_default_fetch_mode_options)
+    default_use_stealthy_fetcher: bool = True
+    worker_runtime_use_stealthy_fetcher: Optional[bool] = None
+    worker_healthy: bool = False
+    worker_restart_supported: bool = False
+    # Deux workers crawl dédiés (SILO_DUAL_CRAWL_WORKERS=true) — choix JS / HTTP sans redémarrage
+    dual_crawl_workers: bool = False
+    worker_crawl_stealthy_healthy: Optional[bool] = None
+    worker_crawl_http_healthy: Optional[bool] = None
 
 
 # Store en mémoire (fallback si pas de DB)
@@ -110,8 +177,35 @@ _graph_cache: dict[str, GraphData] = {}
 _crawl_status: dict[str, CrawlStatus] = {}
 
 USE_DB = bool(os.environ.get("DATABASE_URL"))
-REDIS_URL = os.environ.get("REDIS_URL")
 QUEUE_KEY = "silo:crawl_queue"
+
+_logger = logging.getLogger("silo-api")
+
+
+def _api_default_use_stealthy_fetcher() -> bool:
+    return os.getenv("SILO_USE_STEALTHY_FETCHER", "true").lower() == "true"
+
+
+def _worker_restart_supported() -> bool:
+    try:
+        from worker_align import worker_restart_command_configured
+
+        return worker_restart_command_configured()
+    except Exception:
+        return bool(os.environ.get("SILO_WORKER_RESTART_COMMAND", "").strip())
+
+
+def _dual_crawl_workers() -> bool:
+    """Deux files + deux processus crawl (stealthy vs HTTP), sans alignement par redémarrage."""
+    return os.getenv("SILO_DUAL_CRAWL_WORKERS", "").lower() in ("1", "true", "yes")
+
+
+def _crawl_queue_key_stealthy() -> str:
+    return os.getenv("SILO_CRAWL_QUEUE_STEALTHY", "silo:crawl_queue:stealthy")
+
+
+def _crawl_queue_key_http() -> str:
+    return os.getenv("SILO_CRAWL_QUEUE_HTTP", "silo:crawl_queue:http")
 
 
 def _get_redis():
@@ -196,6 +290,108 @@ async def health():
     return {"status": "ok", "service": "silo", "db": USE_DB}
 
 
+class WorkerFetchConfigResponse(BaseModel):
+    """État fetch worker (admin / support) — brief stealthy 2026-03-30."""
+
+    desired_use_stealthy: bool
+    runtime_use_stealthy: Optional[bool] = None
+    healthy: bool = False
+    last_restart_at: Optional[str] = None
+    restart_in_progress: bool = False
+    worker_restart_supported: bool = False
+
+
+class WorkerRestartBody(BaseModel):
+    use_stealthy_fetcher: bool
+
+
+@app.get("/api/admin/worker/fetch-config", response_model=WorkerFetchConfigResponse)
+async def admin_worker_fetch_config(_user: str = Depends(require_auth)):
+    """
+    Configuration fetch worker : valeurs Redis + intention de déploiement (SILO_USE_STEALTHY_FETCHER côté API).
+    """
+    wr: Optional[bool] = None
+    healthy = False
+    last_at: Optional[str] = None
+    restarting = False
+    r = _get_redis()
+    if r:
+        try:
+            from worker.redis_runtime import (
+                read_runtime_stealthy,
+                is_worker_healthy,
+                WORKER_LAST_RESTART_AT_KEY,
+                WORKER_RESTART_IN_PROGRESS_KEY,
+                dual_crawl_worker_health,
+            )
+
+            if _dual_crawl_workers():
+                ws, wh = dual_crawl_worker_health(r)
+                healthy = bool(ws and wh)
+                wr = None
+            else:
+                wr = read_runtime_stealthy(r)
+                healthy = is_worker_healthy(r)
+            raw_lr = r.get(WORKER_LAST_RESTART_AT_KEY)
+            if raw_lr:
+                last_at = raw_lr.decode() if isinstance(raw_lr, bytes) else str(raw_lr)
+            restarting = bool(r.get(WORKER_RESTART_IN_PROGRESS_KEY))
+        except Exception:
+            pass
+    wrs = True if _dual_crawl_workers() else _worker_restart_supported()
+    return WorkerFetchConfigResponse(
+        desired_use_stealthy=_api_default_use_stealthy_fetcher(),
+        runtime_use_stealthy=wr,
+        healthy=healthy,
+        last_restart_at=last_at,
+        restart_in_progress=restarting,
+        worker_restart_supported=wrs,
+    )
+
+
+@app.post("/api/admin/worker/restart")
+async def admin_worker_restart(body: WorkerRestartBody, _user: str = Depends(require_auth)):
+    """Redémarrage aligné sur un mode fetch explicite (sans lancer de crawl)."""
+    if _dual_crawl_workers():
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": "Mode SILO_DUAL_CRAWL_WORKERS actif : redémarrer les services silo-worker-crawl-stealthy / silo-worker-crawl-http via Docker.",
+                "code": "DUAL_WORKERS_NO_SINGLE_RESTART",
+            },
+        )
+    r = _get_redis()
+    if not r:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Redis indisponible.", "code": "WORKER_UNAVAILABLE"},
+        )
+    try:
+        from worker_align import ensure_worker_fetch_mode, AlignWorkerError
+
+        action = ensure_worker_fetch_mode(r, body.use_stealthy_fetcher)
+    except AlignWorkerError as e:
+        _logger.warning(
+            "worker_restart_failed user=%s code=%s detail=%s",
+            _user,
+            e.code,
+            e.detail,
+        )
+        status = 503
+        if e.code == "WORKER_ALIGN_IN_PROGRESS":
+            status = 409
+        elif e.code == "WORKER_ALIGN_TIMEOUT":
+            status = 504
+        return JSONResponse(status_code=status, content={"detail": e.detail, "code": e.code})
+    _logger.info(
+        "worker_restart_ok user=%s use_stealthy=%s worker_action=%s",
+        _user,
+        body.use_stealthy_fetcher,
+        action,
+    )
+    return {"ok": True, "message": "Worker aligné sur le mode demandé.", "worker_action": action}
+
+
 @app.get("/api/admin/long-queries")
 async def get_long_queries(min_duration_sec: int = 30):
     """
@@ -257,9 +453,37 @@ async def get_crawl_config():
     Sans authentification (données non sensibles).
     Configurable via SILO_PATH_PREFIX_OPTIONS et SILO_DEFAULT_EXCLUDE_URLS_WITH_PARAMS.
     """
+    wr: Optional[bool] = None
+    healthy = False
+    dual = _dual_crawl_workers()
+    ws: Optional[bool] = None
+    wh: Optional[bool] = None
+    r = _get_redis()
+    if r:
+        try:
+            from worker.redis_runtime import read_runtime_stealthy, is_worker_healthy, dual_crawl_worker_health
+
+            if dual:
+                ws, wh = dual_crawl_worker_health(r)
+                wr = None
+                healthy = bool(ws and wh)
+            else:
+                wr = read_runtime_stealthy(r)
+                healthy = is_worker_healthy(r)
+        except Exception:
+            pass
+    wrs = True if dual else _worker_restart_supported()
     return CrawlConfigResponse(
         path_prefix_options=_get_path_prefix_options(),
         default_exclude_urls_with_params=_get_default_exclude_urls_with_params(),
+        fetch_mode_options=_default_fetch_mode_options(),
+        default_use_stealthy_fetcher=_api_default_use_stealthy_fetcher(),
+        worker_runtime_use_stealthy_fetcher=wr,
+        worker_healthy=healthy,
+        worker_restart_supported=wrs,
+        dual_crawl_workers=dual,
+        worker_crawl_stealthy_healthy=ws,
+        worker_crawl_http_healthy=wh,
     )
 
 
@@ -280,7 +504,11 @@ async def list_projects():
 
 
 @app.post("/api/projects", response_model=Project)
-async def create_project(name: str, seed_url: str):
+async def create_project(name: str, seed_url: str, _user: str = Depends(require_auth)):
+    from urllib.parse import urlparse
+    parsed = urlparse(seed_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(status_code=400, detail="seed_url doit être une URL http ou https valide")
     if USE_DB:
         try:
             from database.db import get_session
@@ -528,7 +756,7 @@ async def get_crawl_status(project_id: str):
 
 
 @app.post("/api/projects/{project_id}/crawl/pause")
-async def pause_crawl(project_id: str):
+async def pause_crawl(project_id: str, _user: str = Depends(require_auth)):
     """Met le crawl en pause."""
     r = _get_redis()
     if r:
@@ -540,7 +768,7 @@ async def pause_crawl(project_id: str):
 
 
 @app.post("/api/projects/{project_id}/crawl/resume")
-async def resume_crawl(project_id: str):
+async def resume_crawl(project_id: str, _user: str = Depends(require_auth)):
     """Reprend le crawl après une pause."""
     r = _get_redis()
     if r:
@@ -552,7 +780,7 @@ async def resume_crawl(project_id: str):
 
 
 @app.post("/api/projects/{project_id}/crawl/stop")
-async def stop_crawl(project_id: str):
+async def stop_crawl(project_id: str, _user: str = Depends(require_auth)):
     """Stoppe définitivement le crawl en cours."""
     r = _get_redis()
     if r:
@@ -584,8 +812,11 @@ async def stop_crawl(project_id: str):
 
 
 @app.post("/api/projects/{project_id}/crawl")
-async def start_crawl(project_id: str, config: Optional[CrawlConfig] = Body(default=None)):
-    """Démarre le crawl. Body optionnel: { max_depth, max_pages, run_ner }"""
+async def start_crawl(project_id: str, config: Optional[CrawlConfig] = Body(default=None), _user: str = Depends(require_auth)):
+    """
+    Démarre le crawl. Body optionnel: CrawlConfig.
+    Si use_stealthy_fetcher est true/false, aligne le worker (redémarrage possible) avant enqueue.
+    """
     # Vérifier que le projet existe
     if USE_DB:
         try:
@@ -620,47 +851,158 @@ async def start_crawl(project_id: str, config: Optional[CrawlConfig] = Body(defa
     elif path_prefix == "":
         path_prefix = None
 
+    t_align0 = time.monotonic()
+    worker_action: str = "none"
     r = _get_redis()
-    urls_total_for_status = None
-    if r:
+    dual = _dual_crawl_workers()
+    target_queue = QUEUE_KEY
+    effective_fetch: Optional[bool] = cfg.use_stealthy_fetcher
+
+    if dual:
+        if not r:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Redis indisponible : impossible de vérifier les workers crawl.", "code": "WORKER_UNAVAILABLE"},
+            )
+        if effective_fetch is None:
+            effective_fetch = _api_default_use_stealthy_fetcher()
+        target_queue = _crawl_queue_key_stealthy() if effective_fetch else _crawl_queue_key_http()
         try:
-            r.delete(f"{CRAWL_PAUSE_KEY}:{project_id}", f"{CRAWL_STOP_KEY}:{project_id}")
-            if cfg.url_list and len(cfg.url_list) > 0:
-                # Mode batch: une job par URL (crawl uniquement ces URLs, pas de suivi des liens)
-                from urllib.parse import urlparse
-                valid_count = 0
-                for u in cfg.url_list:
-                    u = (u or "").strip()
-                    if not u or not u.startswith(("http://", "https://")):
-                        continue
-                    if cfg.exclude_urls_with_params and urlparse(u).query:
-                        continue
-                    payload = {
-                        "project_id": project_id,
-                        "seed_url": u,
-                        "max_depth": 0,
-                        "max_pages": 1,
-                        "run_ner": cfg.run_ner,
-                        "path_prefix": path_prefix,
-                        "exclude_urls_with_params": cfg.exclude_urls_with_params,
-                    }
-                    r.rpush(QUEUE_KEY, json.dumps(payload))
-                    valid_count += 1
-                urls_total_for_status = valid_count
-                _set_crawl_urls_total(project_id, valid_count)
-            else:
+            from worker.redis_runtime import CRAWL_ROLE_STEALTHY, CRAWL_ROLE_HTTP, is_worker_healthy
+
+            role_ok = is_worker_healthy(
+                r,
+                CRAWL_ROLE_STEALTHY if effective_fetch else CRAWL_ROLE_HTTP,
+            )
+            if not role_ok:
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "detail": "Le worker crawl demandé (navigateur/JS ou HTTP) ne répond pas (heartbeat).",
+                        "code": "WORKER_CRAWL_UNHEALTHY",
+                        "use_stealthy_fetcher": effective_fetch,
+                    },
+                )
+        except Exception as e:
+            _logger.warning("dual_crawl health check: %s", e)
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Impossible de vérifier l'état des workers crawl.", "code": "WORKER_UNAVAILABLE"},
+            )
+    elif cfg.use_stealthy_fetcher is not None:
+        if not r:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Redis indisponible : impossible de vérifier le mode du worker.", "code": "WORKER_UNAVAILABLE"},
+            )
+        try:
+            from worker_align import ensure_worker_fetch_mode, AlignWorkerError
+
+            worker_action = ensure_worker_fetch_mode(r, cfg.use_stealthy_fetcher)
+        except AlignWorkerError as e:
+            _logger.warning(
+                "crawl_align_failed user=%s project=%s code=%s duration_ms=%s",
+                _user,
+                project_id,
+                e.code,
+                int((time.monotonic() - t_align0) * 1000),
+            )
+            status = 503
+            if e.code == "WORKER_ALIGN_IN_PROGRESS":
+                status = 409
+            elif e.code == "WORKER_ALIGN_TIMEOUT":
+                status = 504
+            return JSONResponse(status_code=status, content={"detail": e.detail, "code": e.code})
+
+    log_extra = effective_fetch if dual else cfg.use_stealthy_fetcher
+    if log_extra is None and r and not dual:
+        try:
+            from worker_align import get_worker_state
+
+            s, _ = get_worker_state(r)
+            log_extra = s
+        except Exception:
+            pass
+
+    _logger.info(
+        "crawl_start user=%s project=%s use_stealthy_requested=%s worker_action=%s restarted=%s duration_align_ms=%s outcome=%s dual=%s queue=%s",
+        _user,
+        project_id,
+        cfg.use_stealthy_fetcher,
+        worker_action,
+        worker_action == "restarted",
+        int((time.monotonic() - t_align0) * 1000),
+        "enqueue",
+        dual,
+        target_queue,
+    )
+
+    if not r:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Redis indisponible : impossible d'enfiler le crawl.", "code": "WORKER_UNAVAILABLE"},
+        )
+
+    urls_total_for_status = None
+    try:
+        r.delete(f"{CRAWL_PAUSE_KEY}:{project_id}", f"{CRAWL_STOP_KEY}:{project_id}")
+        base_log: dict = {}
+        if cfg.use_stealthy_fetcher is not None:
+            base_log["requested_fetch_mode"] = cfg.use_stealthy_fetcher
+        elif dual and effective_fetch is not None:
+            base_log["requested_fetch_mode"] = effective_fetch
+
+        if cfg.url_list and len(cfg.url_list) > 0:
+            from urllib.parse import urlparse
+
+            valid_count = 0
+            for u in cfg.url_list:
+                u = (u or "").strip()
+                if not u or not u.startswith(("http://", "https://")):
+                    continue
+                if cfg.exclude_urls_with_params and urlparse(u).query:
+                    continue
                 payload = {
                     "project_id": project_id,
-                    "seed_url": seed_url,
-                    "max_depth": cfg.max_depth,
-                    "max_pages": cfg.max_pages,
+                    "seed_url": u,
+                    "max_depth": 0,
+                    "max_pages": 1,
                     "run_ner": cfg.run_ner,
                     "path_prefix": path_prefix,
                     "exclude_urls_with_params": cfg.exclude_urls_with_params,
+                    **base_log,
                 }
-                r.rpush(QUEUE_KEY, json.dumps(payload))
+                r.rpush(target_queue, json.dumps(payload))
+                valid_count += 1
+            urls_total_for_status = valid_count
+            _set_crawl_urls_total(project_id, valid_count)
+        else:
+            payload = {
+                "project_id": project_id,
+                "seed_url": seed_url,
+                "max_depth": cfg.max_depth,
+                "max_pages": cfg.max_pages,
+                "run_ner": cfg.run_ner,
+                "path_prefix": path_prefix,
+                "exclude_urls_with_params": cfg.exclude_urls_with_params,
+                **base_log,
+            }
+            r.rpush(target_queue, json.dumps(payload))
+    except Exception as e:
+        _logger.exception("Enqueue crawl: %s", e)
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Erreur lors de l'enfilement du crawl.", "code": "WORKER_UNAVAILABLE"},
+        )
+
+    use_eff: Optional[bool] = effective_fetch if dual else cfg.use_stealthy_fetcher
+    if use_eff is None and not dual:
+        try:
+            from worker.redis_runtime import read_runtime_stealthy
+
+            use_eff = read_runtime_stealthy(r)
         except Exception:
-            pass
+            use_eff = None
 
     # Mise à jour statut
     if USE_DB:
@@ -682,10 +1024,15 @@ async def start_crawl(project_id: str, config: Optional[CrawlConfig] = Body(defa
             urls_processed=0,
             urls_total=urls_total_for_status,
             progress_percent=0.0 if urls_total_for_status else None,
-            message="Crawl en attente (worker à connecter)" if not r else "Crawl en cours",
+            message="Crawl en cours",
         )
 
-    return {"ok": True, "message": "Crawl démarré"}
+    return {
+        "ok": True,
+        "message": "Crawl démarré",
+        "worker_action": worker_action,
+        "use_stealthy_fetcher": use_eff,
+    }
 
 
 # Seuil edges au-delà duquel la suppression est asynchrone. Défaut 0 = toujours async (évite timeout front).
@@ -693,7 +1040,7 @@ DELETE_ASYNC_EDGES_THRESHOLD = int(os.environ.get("SILO_DELETE_ASYNC_THRESHOLD",
 
 
 @app.delete("/api/projects/{project_id}")
-async def delete_project_endpoint(project_id: str, async_only: bool = False):
+async def delete_project_endpoint(project_id: str, async_only: bool = False, _user: str = Depends(require_auth)):
     """
     Supprime un projet et ses données (pages, edges).
     Toujours async par défaut : 202 Accepted, soft delete immédiat, worker en arrière-plan.
@@ -756,7 +1103,7 @@ class NerRequest(BaseModel):
 
 
 @app.post("/api/projects/{project_id}/ner")
-async def run_ner_on_demand_endpoint(project_id: str, body: Optional[NerRequest] = Body(default=None)):
+async def run_ner_on_demand_endpoint(project_id: str, body: Optional[NerRequest] = Body(default=None), _user: str = Depends(require_auth)):
     """
     Lance la détection NER sur un nœud ou un silo.
     Disponible uniquement quand le crawl n'est pas en cours.
@@ -806,7 +1153,7 @@ RECOMPUTE_IN_PROGRESS_KEY = "silo:recompute_in_progress"
 
 
 @app.post("/api/projects/{project_id}/recompute-silos")
-async def recompute_silos_endpoint(project_id: str):
+async def recompute_silos_endpoint(project_id: str, _user: str = Depends(require_auth)):
     """
     Recalcule les silos (Louvain) sur le graphe existant.
     Utile quand Title/H1/Silo sont vides après un crawl partiel.
@@ -971,7 +1318,7 @@ OPPORTUNITIES_IN_PROGRESS_KEY = "silo:opportunities_in_progress"
 
 
 @app.post("/api/projects/{project_id}/compute-embeddings")
-async def compute_embeddings_endpoint(project_id: str, page_id: str = None):
+async def compute_embeddings_endpoint(project_id: str, page_id: str = None, _user: str = Depends(require_auth)):
     """
     Calcule les embeddings pour les pages (Phase 2 partielle).
     Si page_id est fourni, ne traite que cette page.
@@ -1064,7 +1411,7 @@ async def get_opportunities(project_id: str, min_similarity: float = 0.9, with_s
 
 
 @app.post("/api/opportunities/{project_id}/compute")
-async def compute_opportunities_endpoint(project_id: str):
+async def compute_opportunities_endpoint(project_id: str, _user: str = Depends(require_auth)):
     """
     Lance le calcul et le stockage des opportunités en arrière-plan (worker).
     Les résultats seront disponibles via GET /api/opportunities/{project_id} une fois terminé.
@@ -1342,7 +1689,7 @@ class SaveOpportunitiesRequest(BaseModel):
 
 
 @app.post("/api/projects/{project_id}/opportunities/save")
-async def save_opportunities_endpoint(project_id: str, body: SaveOpportunitiesRequest):
+async def save_opportunities_endpoint(project_id: str, body: SaveOpportunitiesRequest, _user: str = Depends(require_auth)):
     """Enregistre des opportunités en BDD (stockage indéfini)."""
     if USE_DB:
         try:
@@ -1386,7 +1733,7 @@ async def list_opportunity_records_endpoint(project_id: str, page_id: str = None
 
 
 @app.delete("/api/projects/{project_id}/opportunities/records/{record_id:int}")
-async def delete_opportunity_record_endpoint(project_id: str, record_id: int):
+async def delete_opportunity_record_endpoint(project_id: str, record_id: int, _user: str = Depends(require_auth)):
     """Supprime une opportunité enregistrée."""
     if USE_DB:
         try:

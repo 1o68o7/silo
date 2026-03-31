@@ -793,11 +793,25 @@ def run_crawl(
     phase1_only: bool = False,
     path_prefix: str | None = None,
     exclude_urls_with_params: bool = True,
+    requested_fetch_mode: bool | None = None,
 ):
     """
     Exécute le crawl: Phase 1 (rapide) puis Phase 2 (NER) si run_ner=True.
     phase1_only=True: arrête après Phase 1 (pour workers séparés, le worker-nlp fera Phase 2).
+    requested_fetch_mode: valeur demandée par l'API (logs audit EF4) ; le mode effectif vient du worker.
     """
+    from worker.fetcher import USE_STEALTHY
+
+    mode_label = "navigateur (stealthy)" if USE_STEALTHY else "HTTP simple"
+    _push_log(
+        project_id,
+        "info",
+        f"Démarrage crawl — mode fetch effectif: {mode_label}",
+        extra={
+            "use_stealthy_fetcher": USE_STEALTHY,
+            **({"requested_fetch_mode": requested_fetch_mode} if requested_fetch_mode is not None else {}),
+        },
+    )
     run_crawl_phase1(
         project_id,
         seed_url,

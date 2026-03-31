@@ -24,6 +24,10 @@ RUN python -m spacy download fr_core_news_lg
 COPY . .
 ENV PYTHONPATH=/app
 
+# Brief §8.1 : vérifie Redis + heartbeat écrit par le worker (readiness infra).
+HEALTHCHECK --interval=40s --timeout=15s --start-period=240s --retries=3 \
+    CMD python -c "import os,sys,redis; from worker.redis_runtime import WORKER_RUNTIME_HEARTBEAT_KEY; r=redis.from_url(os.environ.get('REDIS_URL') or 'redis://127.0.0.1:6379/0'); r.ping(); sys.exit(0 if r.get(WORKER_RUNTIME_HEARTBEAT_KEY) else 1)"
+
 # L'image Scrapling a ENTRYPOINT ["scrapling"] - on le réinitialise pour lancer notre worker
 ENTRYPOINT []
 CMD ["python", "-m", "worker.run"]

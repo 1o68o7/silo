@@ -18,12 +18,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import redis
 from worker.crawler import run_crawl, run_crawl_phase2, run_ner_on_demand, recompute_silos, run_compute_embeddings, run_compute_opportunities, run_delete_project, _check_stop
+from worker.redis_runtime import write_worker_runtime, refresh_worker_heartbeat
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("silo-worker")
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6380/0")
-QUEUE_KEY = "silo:crawl_queue"
+DEFAULT_CRAWL_QUEUE = "silo:crawl_queue"
+CRAWL_QUEUE_KEY = os.environ.get("SILO_CRAWL_QUEUE_KEY", DEFAULT_CRAWL_QUEUE).strip() or DEFAULT_CRAWL_QUEUE
+WORKER_CRAWL_ROLE = os.environ.get("SILO_WORKER_CRAWL_ROLE", "").strip() or None
 PHASE2_QUEUE_KEY = "silo:phase2_queue"
 NER_QUEUE_KEY = "silo:ner_queue"
 RECOMPUTE_SILOS_QUEUE_KEY = "silo:recompute_silos_queue"
@@ -55,20 +58,40 @@ def main():
         logger.error(f"Impossible de se connecter à Redis ({REDIS_URL}): {e}")
         raise
 
+    use_stealthy = os.environ.get("SILO_USE_STEALTHY_FETCHER", "true").lower() == "true"
+    try:
+        write_worker_runtime(r, use_stealthy, WORKER_CRAWL_ROLE)
+        refresh_worker_heartbeat(r, WORKER_CRAWL_ROLE)
+        logger.info(
+            "Runtime worker Redis: use_stealthy_fetcher=%s role=%s queue=%s",
+            use_stealthy,
+            WORKER_CRAWL_ROLE or "legacy",
+            CRAWL_QUEUE_KEY,
+        )
+    except Exception as e:
+        logger.warning("Écriture état runtime Redis: %s", e)
+
     if WORKER_MODE == "crawl":
-        queues = [QUEUE_KEY, DELETE_PROJECT_QUEUE_KEY]
-        logger.info("Worker Silo (mode crawl) démarré — Phase 1 + delete, push vers phase2_queue")
+        queues = [CRAWL_QUEUE_KEY, DELETE_PROJECT_QUEUE_KEY]
+        logger.info(
+            "Worker Silo (mode crawl) démarré — queue=%s, Phase 1 + delete, push vers phase2_queue",
+            CRAWL_QUEUE_KEY,
+        )
     elif WORKER_MODE == "nlp":
         queues = [PHASE2_QUEUE_KEY, NER_QUEUE_KEY, RECOMPUTE_SILOS_QUEUE_KEY, COMPUTE_EMBEDDINGS_QUEUE_KEY, COMPUTE_OPPORTUNITIES_QUEUE_KEY, DELETE_PROJECT_QUEUE_KEY]
         logger.info("Worker Silo (mode nlp) démarré — Phase 2, NER, silos, embeddings, opportunités, delete")
         _preload_nlp_models()
     else:
-        queues = [QUEUE_KEY, NER_QUEUE_KEY, RECOMPUTE_SILOS_QUEUE_KEY, COMPUTE_EMBEDDINGS_QUEUE_KEY, COMPUTE_OPPORTUNITIES_QUEUE_KEY, DELETE_PROJECT_QUEUE_KEY]
+        queues = [CRAWL_QUEUE_KEY, NER_QUEUE_KEY, RECOMPUTE_SILOS_QUEUE_KEY, COMPUTE_EMBEDDINGS_QUEUE_KEY, COMPUTE_OPPORTUNITIES_QUEUE_KEY, DELETE_PROJECT_QUEUE_KEY]
         logger.info("Worker Silo (mode full) démarré, écoute crawl + NER + silos + embeddings + delete...")
         _preload_nlp_models()
 
     while True:
         try:
+            try:
+                refresh_worker_heartbeat(r, WORKER_CRAWL_ROLE)
+            except Exception:
+                pass
             result = r.blpop(queues, timeout=30)
             if result:
                 queue_name, payload = result
@@ -181,7 +204,7 @@ def main():
                     if _check_stop(project_id):
                         logger.info(f"Job crawl ignoré (stop demandé): {project_id}")
                         try:
-                            r.rpush(QUEUE_KEY, payload)
+                            r.rpush(queue_name, payload)
                             time.sleep(1)
                         except Exception:
                             pass
@@ -192,7 +215,10 @@ def main():
                         path_prefix = data.get("path_prefix")
                         exclude_urls_with_params = data.get("exclude_urls_with_params", True)
                         phase1_only = WORKER_MODE == "crawl" and run_ner
-                        logger.info(f"Job crawl reçu: {project_id} -> {seed_url} (depth={max_depth}, max={max_pages}, ner={run_ner}, path_prefix={path_prefix}, exclude_params={exclude_urls_with_params}, phase1_only={phase1_only})")
+                        req_mode = data.get("requested_fetch_mode")
+                        logger.info(
+                            f"Job crawl reçu: {project_id} -> {seed_url} (depth={max_depth}, max={max_pages}, ner={run_ner}, path_prefix={path_prefix}, exclude_params={exclude_urls_with_params}, phase1_only={phase1_only}, use_stealthy_fetcher={use_stealthy}, requested_fetch_mode={req_mode})"
+                        )
                         try:
                             run_crawl(
                                 project_id,
@@ -203,6 +229,7 @@ def main():
                                 phase1_only=phase1_only,
                                 path_prefix=path_prefix,
                                 exclude_urls_with_params=exclude_urls_with_params,
+                                requested_fetch_mode=req_mode,
                             )
                             if phase1_only and run_ner and not _check_stop(project_id):
                                 r.rpush(PHASE2_QUEUE_KEY, json.dumps({"project_id": project_id}))

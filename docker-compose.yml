@@ -1,6 +1,6 @@
 # Silo - Semantic Cocoon (standalone pour dev local)
 # Intégré au docker-compose principal log8ot pour la prod
-version: '3.8'
+# (attribut `version` retiré : obsolète avec Docker Compose v2)
 
 services:
   db:
@@ -29,6 +29,8 @@ services:
     environment:
       DATABASE_URL: postgresql://admin:password_secret@db:5432/semantic_cocoon
       REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-changeme_set_JWT_SECRET_KEY_in_env}
+      SILO_REQUIRE_AUTH: ${SILO_REQUIRE_AUTH:-true}
     depends_on:
       - db
       - redis
