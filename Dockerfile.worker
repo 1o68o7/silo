@@ -15,8 +15,7 @@ RUN pip install --no-cache-dir \
     pgvector>=0.3.6 \
     lxml>=5.0.0 \
     numpy>=1.24.0 \
-    spacy>=3.7.0 \
-    cdlib>=0.3.0
+    spacy>=3.7.0
 
 # Modèle spaCy français
 RUN python -m spacy download fr_core_news_lg

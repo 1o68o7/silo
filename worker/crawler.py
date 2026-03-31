@@ -3,7 +3,7 @@ Worker de crawl Silo - Brief complet.
 Architecture en 2 phases:
   Phase 1: Crawl rapide (URLs, structure, silos) - sans NER ni embeddings lourds
   Phase 2: Détection NER (à la demande ou en batch après Phase 1)
-Stack: Scrapling (StealthyFetcher) + Trafilatura + FastEmbed + spaCy + CDlib.
+Stack: Scrapling (StealthyFetcher) + Trafilatura + FastEmbed + spaCy + Louvain (NetworkX).
 Reasonable Surfer: poids positionnel, similarité sémantique, bonus ancre NER.
 """
 import gc
@@ -52,6 +52,16 @@ LINK_CONTEXT_WINDOW = int(os.environ.get("SILO_LINK_CONTEXT_WINDOW", "150"))
 RUN_REASONABLE_SURFER = os.environ.get("SILO_RUN_REASONABLE_SURFER", "true").lower() == "true"
 # Phase 1: Louvain différé (exécuter à la demande via Recalcul silos)
 LOUVAIN_DEFERRED = os.environ.get("SILO_LOUVAIN_DEFERRED", "false").lower() == "true"
+
+
+def _louvain_partition_sets(G_undir: nx.Graph):
+    """
+    Détection de communautés (Louvain) via NetworkX uniquement.
+    Évite cdlib et son chaînage matplotlib → gros pic mémoire sur VPS serré.
+    """
+    from networkx.algorithms.community import louvain_communities
+
+    return list(louvain_communities(G_undir, weight="weight", seed=42))
 
 
 def _get_embedding_model():
@@ -471,13 +481,11 @@ def run_crawl_phase1(
                 G.add_edge(e.source_id, e.target_id, weight=e.weight or 0.5)
             if G.number_of_nodes() > 0:
                 try:
-                    import cdlib
-                    from cdlib import algorithms
                     G_undir = G.to_undirected()
-                    coms = algorithms.louvain(G_undir)
+                    partitions = _louvain_partition_sets(G_undir)
                     updates = [
                         {"id": nid, "silo_id": str(i)}
-                        for i, community in enumerate(coms.communities)
+                        for i, community in enumerate(partitions)
                         for nid in community
                     ]
                     if updates:
@@ -991,14 +999,14 @@ def recompute_silos(project_id: str):
         if _check_stop(project_id):
             _push_log(project_id, "info", "Recalcul silos stoppé par l'utilisateur")
             return
-        edges = session.query(Edge).filter(Edge.project_id == project_id).all()
-        if not edges:
+        G = nx.DiGraph()
+        edge_count = 0
+        for e in session.query(Edge).filter(Edge.project_id == project_id).yield_per(2000):
+            G.add_edge(e.source_id, e.target_id, weight=e.weight or 0.5)
+            edge_count += 1
+        if edge_count == 0:
             _push_log(project_id, "info", "Recalcul silos: aucun lien, rien à faire")
             return
-
-        G = nx.DiGraph()
-        for e in edges:
-            G.add_edge(e.source_id, e.target_id, weight=e.weight or 0.5)
 
         if G.number_of_nodes() == 0:
             return
@@ -1006,9 +1014,7 @@ def recompute_silos(project_id: str):
         if _check_stop(project_id):
             _push_log(project_id, "info", "Recalcul silos stoppé par l'utilisateur")
             return
-        import cdlib
-        from cdlib import algorithms
-        total_edges = len(edges)
+
         total_nodes = G.number_of_nodes()
 
         def _update_progress(nodes_processed: int):
@@ -1017,7 +1023,7 @@ def recompute_silos(project_id: str):
                 r.set(
                     f"silo:recompute_progress:{project_id}",
                     json.dumps({
-                        "total_edges": total_edges,
+                        "total_edges": edge_count,
                         "edges_processed": nodes_processed,
                         "total_nodes": total_nodes,
                     }),
@@ -1027,23 +1033,25 @@ def recompute_silos(project_id: str):
                 pass
 
         _update_progress(0)
+        gc.collect()
         G_undir = G.to_undirected()
-        coms = algorithms.louvain(G_undir)
-        nodes_processed = 0
-        for i, community in enumerate(coms.communities):
-            if _check_stop(project_id):
-                _push_log(project_id, "info", "Recalcul silos stoppé par l'utilisateur")
-                session.commit()
-                return
-            for nid in community:
-                p = session.query(Page).filter(Page.id == nid, Page.project_id == project_id).first()
-                if p:
-                    p.silo_id = str(i)
-                nodes_processed += 1
-            if nodes_processed % 500 == 0 or nodes_processed == total_nodes:
-                _update_progress(nodes_processed)
+        partitions = _louvain_partition_sets(G_undir)
+        del G_undir
+        del G
+        gc.collect()
+        if _check_stop(project_id):
+            _push_log(project_id, "info", "Recalcul silos stoppé par l'utilisateur")
+            return
+        updates = [
+            {"id": nid, "silo_id": str(i)}
+            for i, community in enumerate(partitions)
+            for nid in community
+        ]
+        if updates:
+            session.bulk_update_mappings(Page, updates)
+        _update_progress(len(updates))
         session.commit()
-        _push_log(project_id, "info", f"Recalcul silos: {len(coms.communities)} communauté(s) identifiée(s)")
+        _push_log(project_id, "info", f"Recalcul silos: {len(partitions)} communauté(s) identifiée(s)")
     except Exception as e:
         logger.exception(e)
         session.rollback()
