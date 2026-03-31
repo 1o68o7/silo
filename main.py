@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Body, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from typing import Optional, List
 import jwt as pyjwt
@@ -1542,12 +1542,22 @@ def _slug_project_name(name: str) -> str:
     return (s or "projet")[:50]
 
 
+def _export_attachment_response(body: bytes, filename: str, content_type: str) -> Response:
+    """Fichier brut + Content-Disposition (évite un JSON {content:...} qui double la taille et fait planter le navigateur)."""
+    safe = filename.replace('"', "").replace("\r", "").replace("\n", "")
+    return Response(
+        content=body,
+        media_type=content_type,
+        headers={"Content-Disposition": f'attachment; filename="{safe}"'},
+    )
+
+
 @app.get("/api/opportunities/{project_id}/export")
 async def export_opportunities(project_id: str, min_similarity: float = 0.9, format: str = "json"):
     """
     Export des opportunités en fichier (json, csv ou md).
-    Retourne le contenu avec headers pour téléchargement.
-    Le nom du fichier inclut le nom du projet.
+    Corps HTTP = fichier brut ; en-tête Content-Disposition: attachment.
+    Le front doit utiliser response.blob() puis lien de téléchargement (pas response.json()).
     """
     project_name = "projet"
     if USE_DB:
@@ -1611,8 +1621,8 @@ async def export_opportunities(project_id: str, min_similarity: float = 0.9, for
                 silo_src,
                 silo_tgt,
             ])
-        content = "\uFEFF" + out.getvalue()
-        return {"content": content, "filename": f"{base_filename}.csv", "mime": "text/csv;charset=utf-8"}
+        content_b = ("\uFEFF" + out.getvalue()).encode("utf-8")
+        return _export_attachment_response(content_b, f"{base_filename}.csv", "text/csv; charset=utf-8")
 
     if fmt == "md":
         from datetime import datetime
@@ -1650,10 +1660,15 @@ async def export_opportunities(project_id: str, min_similarity: float = 0.9, for
                 lines.append(zone.replace("```", "` ` `"))
                 lines.append("```\n")
             lines.append("---\n")
-        return {"content": "\n".join(lines), "filename": f"{base_filename}.md", "mime": "text/markdown"}
-    # json par défaut
-    return {"content": json.dumps({"pairs": pairs, "project_id": project_id}, ensure_ascii=False, indent=2),
-            "filename": f"{base_filename}.json", "mime": "application/json"}
+        md_b = "\n".join(lines).encode("utf-8")
+        return _export_attachment_response(md_b, f"{base_filename}.md", "text/markdown; charset=utf-8")
+    # json par défaut : compact (indent=false) pour limiter la taille sur gros volumes
+    json_b = json.dumps(
+        {"pairs": pairs, "project_id": project_id},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _export_attachment_response(json_b, f"{base_filename}.json", "application/json; charset=utf-8")
 
 
 @app.get("/api/projects/{project_id}/pages/{page_id}")
