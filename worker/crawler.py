@@ -22,6 +22,7 @@ import networkx as nx
 from worker.fetcher import fetch_html, fetch_urls_parallel
 from worker.link_extractor import get_links_with_context
 from worker.ner import extract_entities, extract_entities_batch, anchor_contains_entity
+from worker.redis_runtime import refresh_worker_heartbeat
 from worker.url_utils import url_has_query_params, url_matches_path_prefix
 
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +34,7 @@ _embedding_model = None
 EMBEDDING_BATCH_SIZE = int(os.environ.get("SILO_EMBEDDING_BATCH_SIZE", "16"))
 # Taille des lots DB : évite "named cursor isn't valid anymore" (connexion tenue trop longtemps)
 DB_CHUNK_SIZE = 200
-# Chunk spécifique embeddings (moins de pages par session = moins de RAM)
+# Chunk DB pour autres chemins ; run_compute_embeddings utilise curseur + EMBEDDING_BATCH_SIZE uniquement
 EMBEDDING_DB_CHUNK = int(os.environ.get("SILO_EMBEDDING_DB_CHUNK", "50"))
 # Phase 1: batch commits (réduit round-trips DB)
 PHASE1_BATCH_COMMIT = int(os.environ.get("SILO_PHASE1_BATCH_COMMIT", "5"))
@@ -62,24 +63,50 @@ def _get_embedding_model():
             _embedding_model = TextEmbedding(
                 EMBEDDING_MODEL,
                 cache_dir="/tmp/fastembed_cache",
+                threads=int(os.environ.get("SILO_FASTEMBED_THREADS", "1") or "1"),
             )
         logger.info(f"Modèle FastEmbed chargé: {EMBEDDING_MODEL}")
     return _embedding_model
 
 
 def _embed_texts(model, texts: list):
-    """Encapsule model.embed avec logs et gestion d'erreur."""
+    """Encapsule model.embed : itération + heartbeat pendant l'inférence (ONNX peut monopoliser le CPU longtemps)."""
     if not texts:
         return []
     try:
         logger.debug(f"Embedding batch de {len(texts)} texte(s)")
-        return list(model.embed(texts))
+        out = []
+        r = redis.from_url(REDIS_URL)
+        role = _worker_redis_heartbeat_role()
+        bs = max(1, min(len(texts), EMBEDDING_BATCH_SIZE))
+        n = 0
+        for emb in model.embed(texts, batch_size=bs, parallel=None):
+            out.append(emb)
+            n += 1
+            if n % 2 == 0 or n == len(texts):
+                try:
+                    refresh_worker_heartbeat(r, role)
+                except Exception:
+                    pass
+        return out
     except Exception as e:
         logger.exception(f"Erreur model.embed: {e}")
         raise
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6380/0")
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://admin:password_secret@localhost:5433/semantic_cocoon")
+
+
+def _worker_redis_heartbeat_role():
+    """Même clé que run.py / HEALTHCHECK worker (None → silo:worker_runtime:heartbeat)."""
+    return os.environ.get("SILO_WORKER_CRAWL_ROLE", "").strip() or None
+
+
+def _refresh_worker_hb():
+    try:
+        refresh_worker_heartbeat(redis.from_url(REDIS_URL), _worker_redis_heartbeat_role())
+    except Exception:
+        pass
 CRAWL_LOGS_KEY = "silo:crawl_logs"
 CRAWL_PAUSE_KEY = "silo:crawl_pause"
 CRAWL_STOP_KEY = "silo:crawl_stop"
@@ -126,6 +153,17 @@ def run_delete_project(project_id: str) -> bool:
     Supprime un projet en arrière-plan (batch avec COMMIT).
     Appelé par le worker depuis la queue silo:delete_project_queue.
     """
+    lock_key = f"silo:delete_project_lock:{project_id}"
+    try:
+        rlock = redis.from_url(REDIS_URL)
+        # Évite deux workers qui purgent le même projet en parallèle
+        if not rlock.set(lock_key, "1", nx=True, ex=7200):
+            logger.info(f"Suppression déjà en cours pour {project_id}, on ignore ce job")
+            return True
+    except Exception as e:
+        logger.warning("Lock suppression %s: %s — nouvel essai ultérieur", project_id, e)
+        return False
+
     try:
         from database.db import get_session
         from database.service import delete_project, get_project
@@ -133,8 +171,8 @@ def run_delete_project(project_id: str) -> bool:
         session = get_session()
         try:
             if not get_project(session, project_id, include_deleted=True):
-                logger.warning(f"Projet {project_id} non trouvé pour suppression")
-                return False
+                logger.info(f"Projet {project_id} déjà absent (purge idempotente)")
+                return True
             delete_project(session, project_id)
             logger.info(f"Projet {project_id} supprimé (async)")
             return True
@@ -143,6 +181,11 @@ def run_delete_project(project_id: str) -> bool:
     except Exception as e:
         logger.exception(f"Erreur suppression projet {project_id}: {e}")
         return False
+    finally:
+        try:
+            redis.from_url(REDIS_URL).delete(lock_key)
+        except Exception:
+            pass
 
 
 def url_to_id(url: str) -> str:
@@ -402,6 +445,18 @@ def run_crawl_phase1(
                         {urls_only[0]: fetch_html(urls_only[0])} if urls_only else {}
                     )
                 urls_batch = next_urls_batch
+            elif to_visit and len(visited) < max_pages:
+                # next_urls_batch était vide car _pop_batch() en début d’itération précède
+                # l’enrichissement de to_visit depuis les liens de la page courante.
+                urls_batch = _pop_batch()
+                if not urls_batch:
+                    break
+                urls_only = [u for u, _ in urls_batch]
+                fetched = fetch_urls_parallel(urls_only) if batch_size > 1 else (
+                    {urls_only[0]: fetch_html(urls_only[0])} if urls_only else {}
+                )
+                fetch_future = None
+                continue
             else:
                 break
 
@@ -514,14 +569,17 @@ def run_crawl_phase2(project_id: str):
                     break
                 batch = pages_to_embed[i : i + EMBEDDING_BATCH_SIZE]
                 texts = [(p.content_text or "")[:EMBEDDING_TEXT_MAX_CHARS] for p in batch]
-                embs = list(model.embed(texts))
+                _refresh_worker_hb()
+                embs = _embed_texts(model, texts)
                 entities_list = extract_entities_batch(texts)
                 for p, emb, entities in zip(batch, embs, entities_list):
                     emb_list = emb.tolist() if hasattr(emb, "tolist") else list(emb)
                     p.entities = entities
                     p.embedding = emb_list
                     _push_log(project_id, "info", f"NER: {p.url[:60]}... → {len(entities)} entités", url=p.url)
+                _refresh_worker_hb()
             session.commit()
+            _refresh_worker_hb()
         except Exception as e:
             logger.exception(e)
             session.rollback()
@@ -575,7 +633,7 @@ def run_crawl_phase2(project_id: str):
 
                 to_embed = list(dict.fromkeys(ctx for ctx in context_texts if ctx not in _ctx_emb_cache))
                 if to_embed:
-                    new_embs = list(model.embed(to_embed))
+                    new_embs = _embed_texts(model, to_embed)
                     for ctx, emb in zip(to_embed, new_embs):
                         el = emb.tolist() if hasattr(emb, "tolist") else list(emb)
                         _ctx_emb_cache[ctx] = el
@@ -624,73 +682,44 @@ def run_crawl_phase2(project_id: str):
 def run_compute_embeddings(project_id: str, page_id: str = None):
     """
     Calcule les embeddings pour les pages (Phase 2 partielle).
-    Si page_id est fourni, ne traite que cette page.
-    Sinon, traite toutes les pages sans embedding.
-    Utilise des lots par session pour éviter "named cursor isn't valid anymore".
+    Pagination par curseur (Page.id) + micro-lots : au plus EMBEDDING_BATCH_SIZE lignes
+    chargées en même temps, session fermée entre séries → évite accumuler 12+ pages en RAM
+    (cause typique de SIGKILL après le 1er batch avec e5-large + spaCy).
     """
     from sqlalchemy.orm import sessionmaker
-    from database.models import Project, Page, Edge, Base
+    from database.models import Project, Page, Base
     from database.db import get_engine
-    from sqlalchemy import text
 
     engine = get_engine()
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
+
+    spacy_pipe_cap = int(os.environ.get("SILO_SPACY_PIPE_BATCH_SIZE", "8"))
 
     def _process_batch(session, batch_pages, model):
         """Traite un batch de pages. Retourne nb traité. Lève en cas d'erreur."""
         if not batch_pages:
             return 0
         texts = [(x.content_text or "")[:EMBEDDING_TEXT_MAX_CHARS] for x in batch_pages]
+        _refresh_worker_hb()
         embs = _embed_texts(model, texts)
-        entities_list = extract_entities_batch(texts)
+        _refresh_worker_hb()
+        pipe_bs = max(1, min(spacy_pipe_cap, len(texts)))
+        entities_list = extract_entities_batch(texts, pipe_batch_size=pipe_bs)
+        _refresh_worker_hb()
         for pg, emb, entities in zip(batch_pages, embs, entities_list):
             pg.entities = entities
             pg.embedding = emb.tolist() if hasattr(emb, "tolist") else list(emb)
             _push_log(project_id, "info", f"Embed: {pg.url[:50]}...", url=pg.url)
         session.commit()
-        return len(batch_pages)
-
-    def _process_chunk(session, pages, model):
-        processed = 0
-        batch_acc = []
-        for p in pages:
-            text_content = (p.content_text or "")[:EMBEDDING_TEXT_MAX_CHARS]
-            if not text_content or len(text_content) < 20:
-                continue
-            batch_acc.append(p)
-            if len(batch_acc) >= EMBEDDING_BATCH_SIZE:
-                try:
-                    processed += _process_batch(session, batch_acc, model)
-                    logger.info(f"[Embeddings] Batch {len(batch_acc)} pages → {processed} cumul")
-                except Exception as e:
-                    session.rollback()
-                    logger.warning(f"[Embeddings] Batch {len(batch_acc)} échoué: {e}, fallback 1 par 1")
-                    for pg in batch_acc:
-                        try:
-                            pg_refresh = session.query(Page).filter(Page.id == pg.id).first()
-                            if pg_refresh and pg_refresh.embedding is None:
-                                _process_batch(session, [pg_refresh], model)
-                                processed += 1
-                        except Exception as e2:
-                            logger.warning(f"[Embeddings] Page {pg.id} ignorée: {e2}")
-                batch_acc = []
-        if batch_acc:
+        for pg in batch_pages:
             try:
-                processed += _process_batch(session, batch_acc, model)
-                logger.info(f"[Embeddings] Batch final {len(batch_acc)} pages → {processed} cumul")
-            except Exception as e:
-                session.rollback()
-                logger.warning(f"[Embeddings] Batch final échoué: {e}, fallback 1 par 1")
-                for pg in batch_acc:
-                    try:
-                        pg_refresh = session.query(Page).filter(Page.id == pg.id).first()
-                        if pg_refresh and pg_refresh.embedding is None:
-                            _process_batch(session, [pg_refresh], model)
-                            processed += 1
-                    except Exception as e2:
-                        logger.warning(f"[Embeddings] Page {pg.id} ignorée: {e2}")
-        return processed
+                session.expunge(pg)
+            except Exception:
+                pass
+        _refresh_worker_hb()
+        gc.collect()
+        return len(batch_pages)
 
     session = Session()
     try:
@@ -702,6 +731,7 @@ def run_compute_embeddings(project_id: str, page_id: str = None):
         session.close()
 
     model = _get_embedding_model()
+    _refresh_worker_hb()
     logger.info(f"[Embeddings] Démarrage pour projet {project_id}" + (f" page={page_id}" if page_id else ""))
     if page_id:
         _push_log(project_id, "info", f"[Embeddings] Calcul embedding pour la page {page_id[:20]}...")
@@ -709,52 +739,153 @@ def run_compute_embeddings(project_id: str, page_id: str = None):
         _push_log(project_id, "info", "[Embeddings] Calcul des embeddings pour les opportunités...")
 
     total_processed = 0
-    chunk_num = 0
+    batch_idx = 0
+    last_id = None
     from sqlalchemy import func
+
+    try:
+        _s0 = Session()
+        try:
+            total0 = _s0.query(Page).filter(Page.project_id == project_id).count()
+            with0 = _s0.query(Page).filter(
+                Page.project_id == project_id,
+                Page.embedding.isnot(None),
+            ).count()
+            pend0 = _s0.query(Page).filter(
+                Page.project_id == project_id,
+                Page.embedding.is_(None),
+                Page.content_text.isnot(None),
+                func.length(Page.content_text) >= 20,
+            ).count()
+            redis.from_url(REDIS_URL).set(
+                f"silo:embedding_progress:{project_id}",
+                json.dumps({
+                    "pages_with_embedding": with0,
+                    "total_pages": total0,
+                    "pages_pending_embedding": pend0,
+                    "phase": "started",
+                }),
+                ex=7200,
+            )
+        finally:
+            _s0.close()
+    except Exception:
+        pass
+
+    fetch_limit = max(1, EMBEDDING_BATCH_SIZE)
+
     while True:
         if _check_stop(project_id):
             _push_log(project_id, "info", "Calcul embeddings stoppé par l'utilisateur")
             break
         session = Session()
         try:
-            query = session.query(Page).filter(
+            q = session.query(Page).filter(
                 Page.project_id == project_id,
                 Page.embedding.is_(None),
                 Page.content_text.isnot(None),
                 func.length(Page.content_text) >= 20,
             )
             if page_id:
-                query = query.filter(Page.id == page_id)
-            pages = query.limit(EMBEDDING_DB_CHUNK).all()
+                q = q.filter(Page.id == page_id)
+                pages = q.order_by(Page.id).limit(1).all()
+            else:
+                if last_id is not None:
+                    q = q.filter(Page.id > last_id)
+                pages = q.order_by(Page.id).limit(fetch_limit).all()
             if not pages:
                 break
-            chunk_num += 1
-            n_before = total_processed
-            total_processed += _process_chunk(session, pages, model)
-            logger.info(f"[Embeddings] Lot {chunk_num}: {total_processed - n_before} page(s) → total {total_processed}")
-            gc.collect()  # Libérer mémoire entre chunks (e5-large ~2.2 Go)
-            # Progression Redis pour affichage temps réel (embeddings-status peut lire)
+            if not page_id:
+                last_id = pages[-1].id
+            batch_idx += 1
+            logger.info("[Embeddings] Série %s: %s page(s) chargée(s)", batch_idx, len(pages))
             try:
-                total_pages = session.query(Page).filter(Page.project_id == project_id).count()
-                with_emb = session.query(Page).filter(
+                total_pages_pre = session.query(Page).filter(Page.project_id == project_id).count()
+                with_pre = session.query(Page).filter(
                     Page.project_id == project_id,
                     Page.embedding.isnot(None),
                 ).count()
-                r = redis.from_url(REDIS_URL)
-                r.set(
+                pend_pre = session.query(Page).filter(
+                    Page.project_id == project_id,
+                    Page.embedding.is_(None),
+                    Page.content_text.isnot(None),
+                    func.length(Page.content_text) >= 20,
+                ).count()
+                redis.from_url(REDIS_URL).set(
                     f"silo:embedding_progress:{project_id}",
-                    json.dumps({"pages_with_embedding": with_emb, "total_pages": total_pages}),
+                    json.dumps({
+                        "pages_with_embedding": with_pre,
+                        "total_pages": total_pages_pre,
+                        "pages_pending_embedding": pend_pre,
+                        "phase": "batch_processing",
+                        "batch": batch_idx,
+                        "batch_size": len(pages),
+                    }),
                     ex=7200,
                 )
             except Exception:
                 pass
+            _refresh_worker_hb()
+            logger.info(
+                "[Embeddings] ONNX / NER (fetch=%s, spaCy pipe≤%s)…",
+                fetch_limit,
+                spacy_pipe_cap,
+            )
+            gc.collect()
+            try:
+                total_processed += _process_batch(session, pages, model)
+                logger.info("[Embeddings] Série %s OK → total %s page(s)", batch_idx, total_processed)
+            except Exception as e:
+                logger.warning("[Embeddings] Série %s échouée: %s — fallback page par page", batch_idx, e)
+                try:
+                    session.rollback()
+                except Exception:
+                    pass
+                for pg in pages:
+                    s2 = Session()
+                    try:
+                        p2 = s2.query(Page).filter(
+                            Page.id == pg.id,
+                            Page.project_id == project_id,
+                        ).first()
+                        if p2 and p2.embedding is None:
+                            total_processed += _process_batch(s2, [p2], model)
+                            logger.info("[Embeddings] Rattrapage 1 page: %s…", (p2.url or "")[:48])
+                    except Exception as e2:
+                        logger.warning("[Embeddings] Page %s ignorée: %s", pg.id, e2)
+                    finally:
+                        s2.close()
+                        gc.collect()
+            try:
+                s3 = Session()
+                try:
+                    total_pages = s3.query(Page).filter(Page.project_id == project_id).count()
+                    with_emb = s3.query(Page).filter(
+                        Page.project_id == project_id,
+                        Page.embedding.isnot(None),
+                    ).count()
+                    redis.from_url(REDIS_URL).set(
+                        f"silo:embedding_progress:{project_id}",
+                        json.dumps({"pages_with_embedding": with_emb, "total_pages": total_pages}),
+                        ex=7200,
+                    )
+                finally:
+                    s3.close()
+            except Exception:
+                pass
+            if page_id:
+                break
         except Exception as e:
             logger.exception(e)
-            session.rollback()
+            try:
+                session.rollback()
+            except Exception:
+                pass
             _push_log(project_id, "error", f"Erreur embeddings: {e}")
             break
         finally:
             session.close()
+            gc.collect()
 
     _push_log(project_id, "info", f"Embeddings terminés: {total_processed} page(s)")
 
@@ -1004,6 +1135,42 @@ def run_ner_on_demand(project_id: str, node_id: str = None, silo_id: str = None)
 
             if not pages:
                 break
+
+            try:
+                needs_ner_progress = or_(
+                    Page.entities.is_(None),
+                    func.coalesce(func.jsonb_array_length(Page.entities), 0) == 0,
+                )
+                eligible_n = (
+                    session.query(Page)
+                    .filter(
+                        Page.project_id == project_id,
+                        Page.content_text.isnot(None),
+                        func.length(Page.content_text) >= 20,
+                    )
+                    .count()
+                )
+                pending_n = (
+                    session.query(Page)
+                    .filter(
+                        Page.project_id == project_id,
+                        Page.content_text.isnot(None),
+                        func.length(Page.content_text) >= 20,
+                        needs_ner_progress,
+                    )
+                    .count()
+                )
+                redis.from_url(REDIS_URL).set(
+                    f"silo:ner_progress:{project_id}",
+                    json.dumps({
+                        "pages_pending_ner": pending_n,
+                        "pages_ner_eligible": eligible_n,
+                        "batch_size": len(pages),
+                    }),
+                    ex=7200,
+                )
+            except Exception:
+                pass
 
             for p in pages:
                 if _check_stop(project_id):

@@ -84,17 +84,27 @@ def extract_entities(text: str, max_entities: int = 20) -> List[str]:
         return []
 
 
-def extract_entities_batch(texts: List[str], max_entities: int = 20) -> List[List[str]]:
+def extract_entities_batch(
+    texts: List[str],
+    max_entities: int = 20,
+    pipe_batch_size: Optional[int] = None,
+) -> List[List[str]]:
     """
     Extrait les entités pour plusieurs textes en batch via nlp.pipe (plus rapide).
-    Retourne une liste de listes d'entités, une par texte d'entrée.
+    pipe_batch_size: défaut SILO_SPACY_PIPE_BATCH_SIZE ou 50 ; plafonné par len(texts) et 50 (spaCy).
     """
     nlp = get_nlp()
     if not nlp or not texts:
         return [[] for _ in texts]
+    n = len(texts)
+    if pipe_batch_size is None:
+        cap = int(os.environ.get("SILO_SPACY_PIPE_BATCH_SIZE", "50"))
+    else:
+        cap = pipe_batch_size
+    bs = max(1, min(50, cap, n))
     results = []
     try:
-        for doc in nlp.pipe((t[:5000] if t else "" for t in texts), batch_size=50):
+        for doc in nlp.pipe((t[:5000] if t else "" for t in texts), batch_size=bs):
             entities = []
             for ent in doc.ents:
                 if len(ent.text) <= 1:

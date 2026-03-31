@@ -3,7 +3,9 @@
 Partagé entre l'API et le worker.
 """
 import os
-from typing import Optional
+import threading
+from contextlib import contextmanager
+from typing import Any, Optional
 
 WORKER_RUNTIME_STEALTHY_KEY = "silo:worker_runtime:use_stealthy_fetcher"
 WORKER_RUNTIME_HEARTBEAT_KEY = "silo:worker_runtime:heartbeat"
@@ -47,6 +49,38 @@ def write_worker_runtime(r, use_stealthy: bool, role: Optional[str] = None) -> N
 
 def refresh_worker_heartbeat(r, role: Optional[str] = None) -> None:
     r.set(_heartbeat_key(role), "1", ex=HEARTBEAT_TTL_SEC)
+
+
+@contextmanager
+def worker_heartbeat_keepalive(
+    r: Any,
+    role: Optional[str] = None,
+    interval_sec: float = 30.0,
+):
+    """
+    Rafraîchit périodiquement le heartbeat pendant des sections longues (embed ONNX, spaCy pipe, etc.)
+    pour éviter un HEALTHCHECK Docker / observabilité en défaut si le GIL est monopolisé.
+    """
+    stop = threading.Event()
+
+    def _loop():
+        while not stop.wait(interval_sec):
+            try:
+                refresh_worker_heartbeat(r, role)
+            except Exception:
+                pass
+
+    try:
+        refresh_worker_heartbeat(r, role)
+    except Exception:
+        pass
+    th = threading.Thread(target=_loop, daemon=True, name="silo-worker-heartbeat")
+    th.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        th.join(timeout=5.0)
 
 
 def read_runtime_stealthy(r, role: Optional[str] = None) -> Optional[bool]:

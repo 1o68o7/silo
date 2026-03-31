@@ -12,16 +12,23 @@ import json
 import logging
 import sys
 import time
+import faulthandler
 
 # Ajouter le parent au path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import redis
 from worker.crawler import run_crawl, run_crawl_phase2, run_ner_on_demand, recompute_silos, run_compute_embeddings, run_compute_opportunities, run_delete_project, _check_stop
-from worker.redis_runtime import write_worker_runtime, refresh_worker_heartbeat
+from worker.redis_runtime import (
+    write_worker_runtime,
+    refresh_worker_heartbeat,
+    worker_heartbeat_keepalive,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("silo-worker")
+
+faulthandler.enable(all_threads=True)
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6380/0")
 DEFAULT_CRAWL_QUEUE = "silo:crawl_queue"
@@ -36,6 +43,9 @@ DELETE_PROJECT_QUEUE_KEY = "silo:delete_project_queue"
 WORKER_MODE = os.environ.get("SILO_WORKER_MODE", "full").lower()
 # Délai (s) entre jobs crawl pour éviter surcharge CPU (mode url_list = 1 job/URL)
 JOB_DELAY_SECONDS = float(os.environ.get("SILO_JOB_DELAY_SECONDS", "0.5"))
+# Ré-enfile les projets soft-deleted orphelins + réessais après échec purge
+SOFT_DELETE_SWEEP_SEC = float(os.environ.get("SILO_SOFT_DELETE_SWEEP_SEC", "120"))
+DELETE_QUEUE_MAX_ATTEMPTS = int(os.environ.get("SILO_DELETE_QUEUE_MAX_ATTEMPTS", "12"))
 
 
 def _preload_nlp_models():
@@ -86,12 +96,30 @@ def main():
         logger.info("Worker Silo (mode full) démarré, écoute crawl + NER + silos + embeddings + delete...")
         _preload_nlp_models()
 
+    last_soft_sweep = 0.0
+    if os.environ.get("DATABASE_URL") and SOFT_DELETE_SWEEP_SEC > 0:
+        try:
+            from worker.soft_delete_reconcile import sweep_soft_deleted_projects
+
+            sweep_soft_deleted_projects(r)
+        except Exception as e:
+            logger.warning("soft_delete sweep (démarrage): %s", e)
+
     while True:
         try:
             try:
                 refresh_worker_heartbeat(r, WORKER_CRAWL_ROLE)
             except Exception:
                 pass
+            if SOFT_DELETE_SWEEP_SEC > 0 and time.monotonic() - last_soft_sweep >= SOFT_DELETE_SWEEP_SEC:
+                last_soft_sweep = time.monotonic()
+                if os.environ.get("DATABASE_URL"):
+                    try:
+                        from worker.soft_delete_reconcile import sweep_soft_deleted_projects
+
+                        sweep_soft_deleted_projects(r)
+                    except Exception as e:
+                        logger.warning("soft_delete sweep: %s", e)
             result = r.blpop(queues, timeout=30)
             if result:
                 queue_name, payload = result
@@ -107,7 +135,8 @@ def main():
                     if project_id and not _check_stop(project_id):
                         logger.info(f"Job Phase 2 reçu: {project_id}")
                         try:
-                            run_crawl_phase2(project_id)
+                            with worker_heartbeat_keepalive(r, WORKER_CRAWL_ROLE):
+                                run_crawl_phase2(project_id)
                         except Exception as e:
                             logger.exception(f"Erreur Phase 2 {project_id}: {e}")
                     continue
@@ -123,10 +152,12 @@ def main():
                             logger.info(f"Job NER reçu: {project_id} node={node_id} silo={silo_id}")
                             try:
                                 r.set(f"silo:ner_in_progress:{project_id}", "1", ex=7200)
-                                run_ner_on_demand(project_id, node_id=node_id, silo_id=silo_id)
+                                with worker_heartbeat_keepalive(r, WORKER_CRAWL_ROLE):
+                                    run_ner_on_demand(project_id, node_id=node_id, silo_id=silo_id)
                             finally:
                                 try:
                                     r.delete(f"silo:ner_in_progress:{project_id}")
+                                    r.delete(f"silo:ner_progress:{project_id}")
                                 except Exception:
                                     pass
                     continue
@@ -140,7 +171,8 @@ def main():
                             logger.info(f"Job recalcul silos reçu: {project_id}")
                             try:
                                 r.set(f"silo:recompute_in_progress:{project_id}", "1", ex=3600)
-                                recompute_silos(project_id)
+                                with worker_heartbeat_keepalive(r, WORKER_CRAWL_ROLE):
+                                    recompute_silos(project_id)
                             finally:
                                 try:
                                     r.delete(f"silo:recompute_in_progress:{project_id}")
@@ -159,7 +191,8 @@ def main():
                             logger.info(f"Job compute embeddings reçu: {project_id}" + (f" page={page_id}" if page_id else ""))
                             try:
                                 r.set(f"silo:embedding_in_progress:{project_id}", "1", ex=7200)
-                                run_compute_embeddings(project_id, page_id=page_id)
+                                with worker_heartbeat_keepalive(r, WORKER_CRAWL_ROLE):
+                                    run_compute_embeddings(project_id, page_id=page_id)
                             except Exception as e:
                                 logger.exception(f"Erreur compute embeddings {project_id}: {e}")
                             finally:
@@ -178,7 +211,8 @@ def main():
                         else:
                             logger.info(f"Job compute opportunités reçu: {project_id}")
                             try:
-                                run_compute_opportunities(project_id)
+                                with worker_heartbeat_keepalive(r, WORKER_CRAWL_ROLE):
+                                    run_compute_opportunities(project_id)
                             except Exception as e:
                                 logger.exception(f"Erreur compute opportunités {project_id}: {e}")
                             finally:
@@ -190,12 +224,36 @@ def main():
 
                 if queue_name == DELETE_PROJECT_QUEUE_KEY:
                     project_id = data.get("project_id")
+                    attempt = int(data.get("attempt") or 0)
                     if project_id:
-                        logger.info(f"Job suppression projet reçu: {project_id}")
+                        logger.info(
+                            "Job suppression projet reçu: %s (attempt=%s source=%s)",
+                            project_id,
+                            attempt,
+                            data.get("source") or "queue",
+                        )
+                        ok = False
                         try:
-                            run_delete_project(project_id)
+                            ok = run_delete_project(project_id)
                         except Exception as e:
                             logger.exception(f"Erreur suppression projet {project_id}: {e}")
+                        if not ok and attempt < DELETE_QUEUE_MAX_ATTEMPTS:
+                            r.rpush(
+                                DELETE_PROJECT_QUEUE_KEY,
+                                json.dumps({"project_id": project_id, "attempt": attempt + 1}),
+                            )
+                            logger.warning(
+                                "Ré-enfilage suppression %s (tentative %s/%s)",
+                                project_id,
+                                attempt + 1,
+                                DELETE_QUEUE_MAX_ATTEMPTS,
+                            )
+                        elif not ok:
+                            logger.error(
+                                "Abandon suppression après %s tentatives: %s",
+                                DELETE_QUEUE_MAX_ATTEMPTS,
+                                project_id,
+                            )
                     continue
 
                 project_id = data.get("project_id")
@@ -220,17 +278,18 @@ def main():
                             f"Job crawl reçu: {project_id} -> {seed_url} (depth={max_depth}, max={max_pages}, ner={run_ner}, path_prefix={path_prefix}, exclude_params={exclude_urls_with_params}, phase1_only={phase1_only}, use_stealthy_fetcher={use_stealthy}, requested_fetch_mode={req_mode})"
                         )
                         try:
-                            run_crawl(
-                                project_id,
-                                seed_url,
-                                max_depth=max_depth,
-                                max_pages=max_pages,
-                                run_ner=run_ner,
-                                phase1_only=phase1_only,
-                                path_prefix=path_prefix,
-                                exclude_urls_with_params=exclude_urls_with_params,
-                                requested_fetch_mode=req_mode,
-                            )
+                            with worker_heartbeat_keepalive(r, WORKER_CRAWL_ROLE):
+                                run_crawl(
+                                    project_id,
+                                    seed_url,
+                                    max_depth=max_depth,
+                                    max_pages=max_pages,
+                                    run_ner=run_ner,
+                                    phase1_only=phase1_only,
+                                    path_prefix=path_prefix,
+                                    exclude_urls_with_params=exclude_urls_with_params,
+                                    requested_fetch_mode=req_mode,
+                                )
                             if phase1_only and run_ner and not _check_stop(project_id):
                                 r.rpush(PHASE2_QUEUE_KEY, json.dumps({"project_id": project_id}))
                             # Throttle entre jobs pour éviter surcharge CPU (mode url_list = 1 job/URL)

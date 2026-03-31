@@ -115,12 +115,22 @@ class DirectoryTreeData(BaseModel):
 class CrawlStatus(BaseModel):
     """Réponse GET /api/projects/{id}/crawl-status — progression fiable (BRIEF crawl-status enrichi mars 2026)."""
     project_id: str
-    status: str  # crawling | done | paused | stopped | idle | error
+    status: str  # crawling | phase1_done | done | paused | stopped | idle | error
     urls_discovered: int = 0
     urls_processed: int = 0
     urls_total: Optional[int] = None  # Mode url_list: len(url_list). Mode seed_url: null.
     progress_percent: Optional[float] = None  # Fiable si urls_total défini ; sinon estimation ou null
     message: Optional[str] = None
+    # Pipeline async (Phase 1 worker → Phase 2 worker) : le front peut rafraîchir / proposer une action
+    pipeline_pending: bool = False
+    pending_actions: list[str] = Field(
+        default_factory=list,
+        description="Codes stables pour i18n : phase2_required, embeddings_incomplete, pipeline_error.",
+    )
+    embeddings_remaining: Optional[int] = Field(
+        default=None,
+        description="Pages sans embedding (même critère que Phase 2). Null si pipeline_pending est faux.",
+    )
 
 
 class FetchModeOption(BaseModel):
@@ -691,11 +701,16 @@ def _build_crawl_status_enriched(project_id: str, s: dict) -> CrawlStatus:
     urls_total = _get_crawl_urls_total(project_id)
     urls_processed = s.get("urls_processed", 0) or 0
     status = s.get("status") or "idle"
+    pipeline_pending = bool(s.get("pipeline_pending"))
+    pending_actions = list(s.get("pending_actions") or [])
+    embeddings_remaining = s.get("embeddings_remaining")
 
     if urls_total is not None:
         urls_discovered = urls_total
-        if status == "done":
+        if status == "done" and not pipeline_pending:
             progress_percent = 100.0
+        elif status == "done" and pipeline_pending:
+            progress_percent = None
         elif urls_total > 0:
             pct = urls_processed / urls_total * 100
             progress_percent = min(100.0, round(pct))
@@ -707,8 +722,13 @@ def _build_crawl_status_enriched(project_id: str, s: dict) -> CrawlStatus:
             s.get("urls_discovered", 0) or 0,
             urls_processed,
         )
-        if status == "done":
+        if status == "done" and not pipeline_pending:
             progress_percent = 100.0
+        elif status == "done" and pipeline_pending:
+            progress_percent = None
+        elif status == "phase1_done":
+            # Phase 1 terminée, Phase 2 à venir : éviter d'afficher 100 % comme « tout fini »
+            progress_percent = None
         else:
             # Total inconnu en mode seed_url → progression non fiable (évite 526300% si urls_discovered=1)
             progress_percent = None
@@ -721,6 +741,9 @@ def _build_crawl_status_enriched(project_id: str, s: dict) -> CrawlStatus:
         urls_total=urls_total,
         progress_percent=progress_percent,
         message=s.get("message"),
+        pipeline_pending=pipeline_pending,
+        pending_actions=pending_actions,
+        embeddings_remaining=embeddings_remaining,
     )
 
 
@@ -782,13 +805,7 @@ async def resume_crawl(project_id: str, _user: str = Depends(require_auth)):
 @app.post("/api/projects/{project_id}/crawl/stop")
 async def stop_crawl(project_id: str, _user: str = Depends(require_auth)):
     """Stoppe définitivement le crawl en cours."""
-    r = _get_redis()
-    if r:
-        try:
-            r.set(f"{CRAWL_STOP_KEY}:{project_id}", "1", ex=86400)
-            r.delete(f"{EMBEDDING_IN_PROGRESS_KEY}:{project_id}")  # Libère le verrou pour permettre un nouveau lancement
-        except Exception:
-            pass
+    _force_crawl_stop_signals(project_id)
 
     # Mise à jour immédiate du statut en BDD pour éviter blocage NER/autres actions
     # (le worker mettra aussi "done" à sa sortie, mais on ne veut pas attendre)
@@ -1045,11 +1062,18 @@ async def delete_project_endpoint(project_id: str, async_only: bool = False, _us
     Supprime un projet et ses données (pages, edges).
     Toujours async par défaut : 202 Accepted, soft delete immédiat, worker en arrière-plan.
     Évite les timeouts front (30s) sur les projets avec beaucoup de pages.
+    Force l'arrêt du crawl en cours (même signaux Redis que POST .../crawl/stop) avant la suppression.
     """
     if USE_DB:
         try:
             from database.db import get_session
-            from database.service import delete_project as db_delete, get_project, count_project_edges, mark_project_deleted
+            from database.service import (
+                delete_project as db_delete,
+                get_project,
+                count_project_edges,
+                mark_project_deleted,
+                update_project_status,
+            )
             session = get_session()
             try:
                 p = get_project(session, project_id)
@@ -1057,6 +1081,18 @@ async def delete_project_endpoint(project_id: str, async_only: bool = False, _us
                     raise HTTPException(status_code=404, detail="Projet non trouvé")
                 edges_count = count_project_edges(session, project_id)
                 session.close()
+
+                _force_crawl_stop_signals(project_id)
+                # Cohérence statut BDD (comme stop_crawl) tant que le projet est encore visible
+                try:
+                    session = get_session()
+                    try:
+                        if get_project(session, project_id):
+                            update_project_status(session, project_id, "done")
+                    finally:
+                        session.close()
+                except Exception:
+                    pass
 
                 # Projet volumineux ou async_only: enqueue pour traitement worker
                 if async_only or edges_count >= DELETE_ASYNC_EDGES_THRESHOLD:
@@ -1254,15 +1290,34 @@ async def get_embeddings_status_endpoint(project_id: str, page_id: str = None):
                     r = redis.from_url(REDIS_URL)
                     if r:
                         result["embedding_in_progress"] = bool(r.exists(f"{EMBEDDING_IN_PROGRESS_KEY}:{project_id}"))
-                        # Progression temps réel si job en cours (Option B du brief)
+                        # Progression temps réel (Redis mis à jour dès le début du job + avant chaque lot)
                         if result["embedding_in_progress"]:
                             progress_data = r.get(f"silo:embedding_progress:{project_id}")
                             if progress_data:
                                 try:
                                     data = json.loads(progress_data)
-                                    result["pages_with_embedding"] = data.get("pages_with_embedding", result["pages_with_embedding"])
+                                    result["pages_with_embedding"] = data.get(
+                                        "pages_with_embedding", result["pages_with_embedding"]
+                                    )
                                     result["total_pages"] = data.get("total_pages", result["total_pages"])
                                     result["has_embeddings"] = result["pages_with_embedding"] > 0
+                                    if "pages_pending_embedding" in data:
+                                        result["pages_pending_embedding"] = data["pages_pending_embedding"]
+                                    if data.get("phase"):
+                                        result["embedding_phase"] = data["phase"]
+                                    if data.get("chunk") is not None:
+                                        result["embedding_chunk"] = data["chunk"]
+                                        result["embedding_chunk_size"] = data.get("chunk_size")
+                                    elif data.get("batch") is not None:
+                                        result["embedding_chunk"] = data["batch"]
+                                        result["embedding_chunk_size"] = data.get("batch_size")
+                                    pw = result.get("pages_with_embedding") or 0
+                                    pend = result.get("pages_pending_embedding")
+                                    if pend is not None and (pw + pend) > 0:
+                                        result["progress_percent"] = round(100.0 * pw / (pw + pend), 1)
+                                    elif result.get("pages_embedding_eligible"):
+                                        elg = result["pages_embedding_eligible"]
+                                        result["progress_percent"] = round(100.0 * pw / elg, 1)
                                 except (json.JSONDecodeError, TypeError):
                                     pass
                     else:
@@ -1297,6 +1352,23 @@ async def get_ner_status_endpoint(project_id: str):
                     r = redis.from_url(REDIS_URL)
                     if r:
                         result["ner_in_progress"] = bool(r.exists(f"{NER_IN_PROGRESS_KEY}:{project_id}"))
+                        if result["ner_in_progress"]:
+                            raw_np = r.get(f"silo:ner_progress:{project_id}")
+                            if raw_np:
+                                try:
+                                    nd = json.loads(raw_np)
+                                    if "pages_pending_ner" in nd:
+                                        result["pages_pending_ner"] = nd["pages_pending_ner"]
+                                    if "pages_ner_eligible" in nd:
+                                        result["pages_ner_eligible"] = nd["pages_ner_eligible"]
+                                    if nd.get("batch_size") is not None:
+                                        result["ner_batch_size"] = nd["batch_size"]
+                                    pe = result.get("pages_ner_eligible") or 0
+                                    pp = result.get("pages_pending_ner")
+                                    if pe > 0 and pp is not None:
+                                        result["progress_percent"] = round(100.0 * (pe - pp) / pe, 1)
+                                except (json.JSONDecodeError, TypeError):
+                                    pass
                     else:
                         result["ner_in_progress"] = False
                 except Exception:
@@ -1315,6 +1387,19 @@ COMPUTE_EMBEDDINGS_QUEUE_KEY = "silo:compute_embeddings_queue"
 EMBEDDING_IN_PROGRESS_KEY = "silo:embedding_in_progress"
 COMPUTE_OPPORTUNITIES_QUEUE_KEY = "silo:compute_opportunities_queue"
 OPPORTUNITIES_IN_PROGRESS_KEY = "silo:opportunities_in_progress"
+
+
+def _force_crawl_stop_signals(project_id: str) -> None:
+    """Signaux Redis pour arrêter le crawl (stop explicite ou suppression projet)."""
+    r = _get_redis()
+    if not r:
+        return
+    try:
+        r.set(f"{CRAWL_STOP_KEY}:{project_id}", "1", ex=86400)
+        r.delete(f"{CRAWL_PAUSE_KEY}:{project_id}")
+        r.delete(f"{EMBEDDING_IN_PROGRESS_KEY}:{project_id}")  # idem stop crawl
+    except Exception:
+        pass
 
 
 @app.post("/api/projects/{project_id}/compute-embeddings")

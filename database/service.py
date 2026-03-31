@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Optional
 import uuid
 
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from .models import Project, Page, Edge, OpportunityRecord, ComputedOpportunity, CrawlQueue, EMBEDDING_DIM
@@ -62,6 +62,12 @@ def get_project(session: Session, project_id: str, include_deleted: bool = False
     if not include_deleted:
         q = q.filter(Project.deleted_at.is_(None))
     return q.first()
+
+
+def list_soft_deleted_project_ids(session: Session) -> list[str]:
+    """IDs encore présents en table avec soft-delete (purge worker en attente ou échouée)."""
+    rows = session.query(Project.id).filter(Project.deleted_at.isnot(None)).all()
+    return [r[0] for r in rows]
 
 
 def get_graph(session: Session, project_id: str, include_excluded: bool = False) -> dict:
@@ -409,20 +415,54 @@ def get_silo_analysis(session: Session, project_id: str) -> Optional[dict]:
     }
 
 
+def count_pages_pending_embeddings(session: Session, project_id: str) -> int:
+    """Pages avec texte exploitable mais sans embedding (reste typique de Phase 2)."""
+    return (
+        session.query(Page)
+        .filter(
+            Page.project_id == project_id,
+            Page.embedding.is_(None),
+            Page.content_text.isnot(None),
+            func.length(Page.content_text) >= 20,
+        )
+        .count()
+    )
+
+
 def get_crawl_status(session: Session, project_id: str) -> dict:
     p = get_project(session, project_id)
     if not p:
         return None
     count = session.query(Page).filter(Page.project_id == project_id).count()
     total = max(count, 1)
-    processed = count if p.status == "done" else count
+    st = p.status or "idle"
+    processed = count if st == "done" else count
+    need_emb = count_pages_pending_embeddings(session, project_id)
+
+    pending_actions: list[str] = []
+    pipeline_pending = False
+    if st == "phase1_done":
+        pipeline_pending = True
+        pending_actions.append("phase2_required")
+    elif st == "done" and need_emb > 0:
+        pipeline_pending = True
+        pending_actions.append("embeddings_incomplete")
+    elif st == "error":
+        pipeline_pending = True
+        pending_actions.append("pipeline_error")
+
+    embeddings_remaining: int | None = need_emb if pipeline_pending else None
+
     return {
         "project_id": project_id,
-        "status": p.status or "idle",
+        "status": st,
         "urls_discovered": p.urls_count or 0,
         "urls_processed": processed,
-        "progress_percent": 100.0 if p.status == "done" else (processed / total * 100) if total else 0,
+        "progress_percent": 100.0 if st == "done" else (processed / total * 100) if total else 0,
         "message": None,
+        "pipeline_pending": pipeline_pending,
+        "pending_actions": pending_actions,
+        "embeddings_remaining": embeddings_remaining,
     }
 
 
@@ -534,10 +574,35 @@ def get_embeddings_status(session: Session, project_id: str, page_id: str = None
         Page.project_id == project_id,
         Page.embedding.isnot(None),
     ).count()
+    eligible = (
+        session.query(Page)
+        .filter(
+            Page.project_id == project_id,
+            Page.content_text.isnot(None),
+            func.length(Page.content_text) >= 20,
+        )
+        .count()
+    )
+    pending = (
+        session.query(Page)
+        .filter(
+            Page.project_id == project_id,
+            Page.embedding.is_(None),
+            Page.content_text.isnot(None),
+            func.length(Page.content_text) >= 20,
+        )
+        .count()
+    )
+    progress_percent: Optional[float] = None
+    if eligible > 0:
+        progress_percent = round(100.0 * with_emb / eligible, 1)
     result = {
         "total_pages": total,
         "pages_with_embedding": with_emb,
         "has_embeddings": with_emb > 0,
+        "pages_embedding_eligible": eligible,
+        "pages_pending_embedding": pending,
+        "progress_percent": progress_percent,
     }
     if page_id:
         page = session.query(Page).filter(
@@ -550,16 +615,45 @@ def get_embeddings_status(session: Session, project_id: str, page_id: str = None
 
 def get_ner_status(session: Session, project_id: str) -> dict:
     """Retourne le statut NER (pages avec entités détectées)."""
-    from sqlalchemy import func
+    from sqlalchemy import func, or_
     total = session.query(Page).filter(Page.project_id == project_id).count()
     with_entities = session.query(Page).filter(
         Page.project_id == project_id,
         Page.entities.isnot(None),
         func.jsonb_array_length(Page.entities) > 0,
     ).count()
+    needs_ner = or_(
+        Page.entities.is_(None),
+        func.coalesce(func.jsonb_array_length(Page.entities), 0) == 0,
+    )
+    eligible = (
+        session.query(Page)
+        .filter(
+            Page.project_id == project_id,
+            Page.content_text.isnot(None),
+            func.length(Page.content_text) >= 20,
+        )
+        .count()
+    )
+    pending_ner = (
+        session.query(Page)
+        .filter(
+            Page.project_id == project_id,
+            Page.content_text.isnot(None),
+            func.length(Page.content_text) >= 20,
+            needs_ner,
+        )
+        .count()
+    )
+    progress_percent: Optional[float] = None
+    if eligible > 0:
+        progress_percent = round(100.0 * (eligible - pending_ner) / eligible, 1)
     return {
         "total_pages": total,
         "pages_with_entities": with_entities,
+        "pages_ner_eligible": eligible,
+        "pages_pending_ner": pending_ner,
+        "progress_percent": progress_percent,
     }
 
 
