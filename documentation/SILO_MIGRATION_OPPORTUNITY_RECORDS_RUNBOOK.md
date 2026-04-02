@@ -46,4 +46,4 @@ Si **`SILO_REQUIRE_AUTH=true`** :
 
 ---
 
-*Miroir du fichier homonyme sous `log8ot/documentation/` lorsque les deux dépôts sont côte à côte.*
+*Version courte. Dépôt **`log8ot`** : runbook long + **miroir SQL** `documentation/silo/scripts/migrate_opportunity_records_implemented.sql` (aligner sur ce fichier `scripts/` en cas de divergence).*
