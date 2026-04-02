@@ -102,6 +102,10 @@ class OpportunityRecord(Base):
     zone_texte = Column(Text)
     phrase_ancre_proposee = Column(String(512))
     created_at = Column(DateTime, default=datetime.utcnow)
+    implemented = Column(Boolean, nullable=False, default=False)
+    implemented_at = Column(DateTime, nullable=True)
+    implemented_by = Column(String(255), nullable=True)
+    implementation_note = Column(Text, nullable=True)
 
 
 class ComputedOpportunity(Base):

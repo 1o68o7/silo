@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Optional
 import uuid
 
-from sqlalchemy import func, text
+from sqlalchemy import func, text, or_
 from sqlalchemy.orm import Session
 
 from .models import Project, Page, Edge, OpportunityRecord, ComputedOpportunity, CrawlQueue, EMBEDDING_DIM
@@ -115,7 +115,13 @@ def get_graph(session: Session, project_id: str, include_excluded: bool = False)
     # Filtrer les edges qui pointent vers des nœuds exclus
     node_ids = {n["id"] for n in nodes}
     edges_data = [
-        {"source": e.source_id, "target": e.target_id, "weight": e.weight or 0.0, "anchor": e.anchor}
+        {
+            "source": e.source_id,
+            "target": e.target_id,
+            "weight": e.weight or 0.0,
+            "anchor": e.anchor,
+            "edge_kind": "crawl",
+        }
         for e in edges
         if e.source_id in node_ids and e.target_id in node_ids
     ]
@@ -1302,58 +1308,166 @@ def get_top_similar_pairs_for_page(
     return result
 
 
+def _serialize_opportunity_record(r: OpportunityRecord, pages_by_id: dict) -> dict:
+    src = pages_by_id.get(r.source_page_id)
+    tgt = pages_by_id.get(r.target_page_id)
+    return {
+        "id": r.id,
+        "source": r.source_page_id,
+        "target": r.target_page_id,
+        "source_url": src.url if src else "",
+        "target_url": tgt.url if tgt else "",
+        "similarity": r.similarity,
+        "zone_texte": r.zone_texte,
+        "phrase_ancre_proposee": r.phrase_ancre_proposee,
+        "created_at": r.created_at.isoformat() + "Z" if r.created_at else "",
+        "implemented": bool(getattr(r, "implemented", False)),
+        "implemented_at": r.implemented_at.isoformat() + "Z" if getattr(r, "implemented_at", None) else None,
+        "implemented_by": getattr(r, "implemented_by", None),
+        "implementation_note": getattr(r, "implementation_note", None),
+    }
+
+
 def save_opportunity_records(session: Session, project_id: str, pairs: list[dict]) -> list[dict]:
-    """Enregistre des opportunités en BDD (stockage indéfini)."""
-    saved = []
+    """
+    Enregistre des opportunités (upsert sur project_id + source_page_id + target_page_id).
+    Met à jour similarité / zone / phrase si la paire existe déjà ; préserve implemented* et created_at.
+    """
+    saved: list[OpportunityRecord] = []
     for p in pairs:
-        rec = OpportunityRecord(
-            project_id=project_id,
-            source_page_id=p["source"],
-            target_page_id=p["target"],
-            similarity=p.get("similarity", 0.0),
-            zone_texte=p.get("zone_texte"),
-            phrase_ancre_proposee=p.get("phrase_ancre_proposee"),
+        src = p["source"]
+        tgt = p["target"]
+        existing = (
+            session.query(OpportunityRecord)
+            .filter(
+                OpportunityRecord.project_id == project_id,
+                OpportunityRecord.source_page_id == src,
+                OpportunityRecord.target_page_id == tgt,
+            )
+            .first()
         )
-        session.add(rec)
+        if existing:
+            existing.similarity = p.get("similarity", 0.0)
+            existing.zone_texte = p.get("zone_texte")
+            existing.phrase_ancre_proposee = p.get("phrase_ancre_proposee")
+            rec = existing
+        else:
+            rec = OpportunityRecord(
+                project_id=project_id,
+                source_page_id=src,
+                target_page_id=tgt,
+                similarity=p.get("similarity", 0.0),
+                zone_texte=p.get("zone_texte"),
+                phrase_ancre_proposee=p.get("phrase_ancre_proposee"),
+            )
+            session.add(rec)
         session.flush()
-        saved.append({
-            "id": rec.id,
-            "source": p["source"],
-            "target": p["target"],
-            "similarity": rec.similarity,
-            "zone_texte": rec.zone_texte,
-            "phrase_ancre_proposee": rec.phrase_ancre_proposee,
-        })
+        saved.append(rec)
     session.commit()
-    return saved
-
-
-def list_opportunity_records(session: Session, project_id: str, page_id: str = None) -> list[dict]:
-    """Liste les opportunités enregistrées, optionnellement filtrées par page."""
-    q = session.query(OpportunityRecord).filter(OpportunityRecord.project_id == project_id)
-    if page_id:
-        q = q.filter(
-            (OpportunityRecord.source_page_id == page_id) |
-            (OpportunityRecord.target_page_id == page_id)
-        )
-    records = q.order_by(OpportunityRecord.created_at.desc()).all()
     pages_by_id = {p.id: p for p in session.query(Page).filter(Page.project_id == project_id).all()}
-    result = []
-    for r in records:
-        src = pages_by_id.get(r.source_page_id)
-        tgt = pages_by_id.get(r.target_page_id)
-        result.append({
-            "id": r.id,
-            "source": r.source_page_id,
-            "target": r.target_page_id,
-            "source_url": src.url if src else "",
-            "target_url": tgt.url if tgt else "",
-            "similarity": r.similarity,
-            "zone_texte": r.zone_texte,
-            "phrase_ancre_proposee": r.phrase_ancre_proposee,
-            "created_at": r.created_at.isoformat() + "Z" if r.created_at else "",
-        })
-    return result
+    return [_serialize_opportunity_record(r, pages_by_id) for r in saved]
+
+
+def list_opportunity_records(
+    session: Session,
+    project_id: str,
+    page_id: str | None = None,
+    page_ids: list[str] | None = None,
+    limit: int | None = None,
+    offset: int = 0,
+) -> list[dict]:
+    """Liste les opportunités enregistrées ; filtres optionnels par page(s) ; pagination limit/offset."""
+    q = session.query(OpportunityRecord).filter(OpportunityRecord.project_id == project_id)
+    if page_ids:
+        id_set = [x for x in page_ids if x]
+        if id_set:
+            q = q.filter(
+                or_(
+                    OpportunityRecord.source_page_id.in_(id_set),
+                    OpportunityRecord.target_page_id.in_(id_set),
+                )
+            )
+    elif page_id:
+        q = q.filter(
+            or_(
+                OpportunityRecord.source_page_id == page_id,
+                OpportunityRecord.target_page_id == page_id,
+            )
+        )
+    q = q.order_by(OpportunityRecord.created_at.desc())
+    if offset > 0:
+        q = q.offset(offset)
+    if limit is not None and limit > 0:
+        q = q.limit(limit)
+    records = q.all()
+    pages_by_id = {p.id: p for p in session.query(Page).filter(Page.project_id == project_id).all()}
+    return [_serialize_opportunity_record(r, pages_by_id) for r in records]
+
+
+def patch_opportunity_record_implementation(
+    session: Session,
+    project_id: str,
+    record_id: int,
+    implemented: bool,
+    user_id: str | None,
+    *,
+    implementation_note: str | None = None,
+    touch_implementation_note: bool = False,
+) -> dict | None:
+    """
+    Met à jour le statut « maillage réalisé » (idempotent sur implemented).
+    touch_implementation_note: si True, enregistre implementation_note (y compris chaîne vide pour effacer).
+    """
+    rec = (
+        session.query(OpportunityRecord)
+        .filter(
+            OpportunityRecord.project_id == project_id,
+            OpportunityRecord.id == record_id,
+        )
+        .first()
+    )
+    if not rec:
+        return None
+    impl_changed = bool(rec.implemented) != bool(implemented)
+    rec.implemented = implemented
+    if impl_changed:
+        if implemented:
+            rec.implemented_at = datetime.utcnow()
+            if user_id and user_id != "anonymous":
+                rec.implemented_by = user_id
+            else:
+                rec.implemented_by = None
+        else:
+            rec.implemented_at = None
+            rec.implemented_by = None
+    if touch_implementation_note:
+        rec.implementation_note = implementation_note
+    session.commit()
+    pages_by_id = {p.id: p for p in session.query(Page).filter(Page.project_id == project_id).all()}
+    return _serialize_opportunity_record(rec, pages_by_id)
+
+
+def get_opportunities_project_summary(session: Session, project_id: str) -> dict:
+    """Agrégats pour l’UI (saved vs computed, embeddings)."""
+    saved_count = session.query(OpportunityRecord).filter(OpportunityRecord.project_id == project_id).count()
+    last_saved_at = (
+        session.query(func.max(OpportunityRecord.created_at))
+        .filter(OpportunityRecord.project_id == project_id)
+        .scalar()
+    )
+    comp = get_computed_opportunities_status(session, project_id)
+    emb = get_embeddings_status(session, project_id)
+    return {
+        "project_id": project_id,
+        "saved_count": int(saved_count),
+        "last_saved_at": last_saved_at.isoformat() + "Z" if last_saved_at else None,
+        "has_saved_opportunities": int(saved_count) > 0,
+        "computed_count": int(comp["count"]) if comp and comp.get("count") is not None else 0,
+        "computed_at": comp.get("computed_at") if comp else None,
+        "has_computed_opportunities": bool(comp and comp.get("count", 0) > 0),
+        "has_embeddings": bool(emb.get("has_embeddings")),
+        "embeddings_status": emb,
+    }
 
 
 def delete_opportunity_record(session: Session, project_id: str, record_id: int) -> bool:

@@ -8,7 +8,7 @@ import uuid
 import time
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Body, Depends, Security
+from fastapi import FastAPI, HTTPException, Body, Depends, Security, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -77,6 +77,7 @@ class GraphEdge(BaseModel):
     target: str
     weight: float
     anchor: Optional[str] = None
+    edge_kind: Optional[str] = "crawl"  # crawl | opportunity (fusion côté client possible)
 
 
 class GraphData(BaseModel):
@@ -1788,6 +1789,11 @@ class SaveOpportunitiesRequest(BaseModel):
     pairs: list[dict]
 
 
+class PatchOpportunityRecordRequest(BaseModel):
+    implemented: bool
+    implementation_note: Optional[str] = None
+
+
 @app.post("/api/projects/{project_id}/opportunities/save")
 async def save_opportunities_endpoint(project_id: str, body: SaveOpportunitiesRequest, _user: str = Depends(require_auth)):
     """Enregistre des opportunités en BDD (stockage indéfini)."""
@@ -1810,9 +1816,41 @@ async def save_opportunities_endpoint(project_id: str, body: SaveOpportunitiesRe
     raise HTTPException(status_code=404, detail="Projet non trouvé")
 
 
+@app.get("/api/projects/{project_id}/opportunities/summary")
+async def get_opportunities_summary_endpoint(project_id: str, _user: str = Depends(require_auth)):
+    """Agrégats saved / computed / embeddings pour l’Explorer (évite heuristiques client)."""
+    if USE_DB:
+        try:
+            from database.db import get_session
+            from database.service import get_project, get_opportunities_project_summary
+            session = get_session()
+            try:
+                if not get_project(session, project_id):
+                    raise HTTPException(status_code=404, detail="Projet non trouvé")
+                return get_opportunities_project_summary(session, project_id)
+            finally:
+                session.close()
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=500, detail="Erreur lors du résumé opportunités")
+    raise HTTPException(status_code=404, detail="Projet non trouvé")
+
+
 @app.get("/api/projects/{project_id}/opportunities/records")
-async def list_opportunity_records_endpoint(project_id: str, page_id: str = None):
-    """Liste les opportunités enregistrées, optionnellement filtrées par page."""
+async def list_opportunity_records_endpoint(
+    project_id: str,
+    page_id: Optional[str] = None,
+    page_ids: Optional[List[str]] = Query(None),
+    limit: Optional[int] = None,
+    offset: int = 0,
+    _user: str = Depends(require_auth),
+):
+    """
+    Liste les opportunités enregistrées.
+    Filtres : page_id (une page) ou page_ids (répéter le paramètre ou liste selon client).
+    Pagination : limit (max 10000), offset.
+    """
     if USE_DB:
         try:
             from database.db import get_session
@@ -1821,7 +1859,15 @@ async def list_opportunity_records_endpoint(project_id: str, page_id: str = None
             try:
                 if not get_project(session, project_id):
                     raise HTTPException(status_code=404, detail="Projet non trouvé")
-                records = list_opportunity_records(session, project_id, page_id)
+                lim = None
+                if limit is not None and limit > 0:
+                    lim = min(limit, 10000)
+                elif limit is not None and limit < 0:
+                    raise HTTPException(status_code=422, detail="limit doit être positif ou omis")
+                off = max(0, offset)
+                records = list_opportunity_records(
+                    session, project_id, page_id=page_id, page_ids=page_ids, limit=lim, offset=off
+                )
                 return {"records": records}
             finally:
                 session.close()
@@ -1830,6 +1876,44 @@ async def list_opportunity_records_endpoint(project_id: str, page_id: str = None
         except Exception:
             return {"records": []}
     return {"records": []}
+
+
+@app.patch("/api/projects/{project_id}/opportunities/records/{record_id:int}")
+async def patch_opportunity_record_endpoint(
+    project_id: str,
+    record_id: int,
+    body: PatchOpportunityRecordRequest,
+    _user: str = Depends(require_auth),
+):
+    """Met à jour le statut « maillage réalisé » (idempotent)."""
+    if USE_DB:
+        try:
+            from database.db import get_session
+            from database.service import get_project, patch_opportunity_record_implementation
+            session = get_session()
+            try:
+                if not get_project(session, project_id):
+                    raise HTTPException(status_code=404, detail="Projet non trouvé")
+                touch_note = "implementation_note" in body.model_fields_set
+                record = patch_opportunity_record_implementation(
+                    session,
+                    project_id,
+                    record_id,
+                    body.implemented,
+                    _user,
+                    implementation_note=body.implementation_note,
+                    touch_implementation_note=touch_note,
+                )
+                if not record:
+                    raise HTTPException(status_code=404, detail="Enregistrement non trouvé")
+                return {"ok": True, "record": record}
+            finally:
+                session.close()
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=500, detail="Erreur lors de la mise à jour")
+    raise HTTPException(status_code=404, detail="Projet non trouvé")
 
 
 @app.delete("/api/projects/{project_id}/opportunities/records/{record_id:int}")
