@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 ENV PORT=8000
 EXPOSE 8000
-# 2 workers : permet de servir health/liste pendant qu'un worker traite graphe/DELETE long
-# VPS 3.8 Go - éviter Cursor sur le serveur pour libérer ~100 MB swap
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+# Workers configurables pour adapter la RAM du VPS.
+# Défaut à 1 worker: évite les OOM observés avec 2 workers sur un conteneur limité.
+# UVICORN_LIMIT_MAX_REQUESTS recycle périodiquement le process pour limiter les dérives mémoire.
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-1} --limit-max-requests ${UVICORN_LIMIT_MAX_REQUESTS:-1000}"]
