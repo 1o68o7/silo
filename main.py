@@ -8,7 +8,7 @@ import uuid
 import time
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Body, Depends, Security, Query
+from fastapi import FastAPI, HTTPException, Body, Depends, Security, Query, BackgroundTasks
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -186,6 +186,7 @@ class CrawlConfigResponse(BaseModel):
 _projects: dict[str, dict] = {}
 _graph_cache: dict[str, GraphData] = {}
 _crawl_status: dict[str, CrawlStatus] = {}
+_agent_readiness_jobs: dict[str, dict] = {}
 
 USE_DB = bool(os.environ.get("DATABASE_URL"))
 QUEUE_KEY = "silo:crawl_queue"
@@ -299,6 +300,321 @@ app.add_middleware(
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "silo", "db": USE_DB}
+
+
+class AgentReadinessChecks(BaseModel):
+    discoverability: bool = True
+    contentAccessibility: bool = True
+    botAccessControl: bool = True
+    protocolDiscovery: bool = True
+    commerce: bool = True
+
+
+class AgentReadinessSubmitRequest(BaseModel):
+    url: str
+    checks: AgentReadinessChecks = Field(default_factory=AgentReadinessChecks)
+
+
+def _run_agent_readiness_job(job_id: str, url: str, checks: dict):
+    from agent_readiness import run_agent_readiness_scan, get_cached_scan_result, set_cached_scan_result
+
+    if USE_DB:
+        try:
+            from database.db import get_session
+            from database.service import (
+                mark_agent_readiness_processing,
+                complete_agent_readiness_job,
+                fail_agent_readiness_job,
+            )
+
+            session = get_session()
+            try:
+                mark_agent_readiness_processing(session, job_id)
+            finally:
+                session.close()
+
+            cached = get_cached_scan_result(url, checks)
+            if cached:
+                result = dict(cached)
+            else:
+                result = run_agent_readiness_scan(url, checks)
+                set_cached_scan_result(url, checks, result)
+            result["jobId"] = job_id
+
+            session = get_session()
+            try:
+                complete_agent_readiness_job(session, job_id, result)
+            finally:
+                session.close()
+            return
+        except Exception as e:
+            try:
+                from database.db import get_session
+                from database.service import fail_agent_readiness_job
+
+                session = get_session()
+                try:
+                    fail_agent_readiness_job(session, job_id, str(e))
+                finally:
+                    session.close()
+            except Exception:
+                pass
+            return
+
+    row = _agent_readiness_jobs.get(job_id)
+    if not row:
+        return
+    row["status"] = "processing"
+    try:
+        cached = get_cached_scan_result(url, checks)
+        if cached:
+            result = dict(cached)
+        else:
+            result = run_agent_readiness_scan(url, checks)
+            set_cached_scan_result(url, checks, result)
+        result["jobId"] = job_id
+        row["status"] = "completed"
+        row["result"] = result
+        row["completedAt"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+    except Exception as e:
+        row["status"] = "failed"
+        row["error"] = str(e)
+        row["completedAt"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+
+
+@app.post("/api/agent-readiness/submit")
+async def submit_agent_readiness(body: AgentReadinessSubmitRequest, background_tasks: BackgroundTasks, _user: str = Depends(require_auth)):
+    from agent_readiness import normalize_url
+    try:
+        parsed = normalize_url(body.url)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    from urllib.parse import urlparse
+    domain = urlparse(parsed).netloc.lower()
+    job_id = str(uuid.uuid4())
+
+    if USE_DB:
+        try:
+            from database.db import get_session
+            from database.service import create_agent_readiness_job
+
+            session = get_session()
+            try:
+                payload = create_agent_readiness_job(session, job_id, parsed, domain)
+            finally:
+                session.close()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Erreur création job: {e}")
+    else:
+        payload = {
+            "jobId": job_id,
+            "status": "pending",
+            "createdAt": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        }
+        _agent_readiness_jobs[job_id] = {
+            **payload,
+            "url": parsed,
+            "domain": domain,
+            "result": None,
+            "error": None,
+        }
+
+    background_tasks.add_task(_run_agent_readiness_job, job_id, parsed, body.checks.model_dump())
+    return payload
+
+
+@app.get("/api/agent-readiness/status")
+async def get_agent_readiness_status(jobId: str, _user: str = Depends(require_auth)):
+    if USE_DB:
+        try:
+            from database.db import get_session
+            from database.service import get_agent_readiness_job
+
+            session = get_session()
+            try:
+                row = get_agent_readiness_job(session, jobId)
+            finally:
+                session.close()
+            if not row:
+                raise HTTPException(status_code=404, detail="Job non trouvé")
+            return {
+                "jobId": row["jobId"],
+                "status": row["status"],
+                "position": 1 if row["status"] == "pending" else 0,
+                "total": 1,
+                "estimatedTime": 30 if row["status"] in ("pending", "processing") else 0,
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Erreur status: {e}")
+
+    row = _agent_readiness_jobs.get(jobId)
+    if not row:
+        raise HTTPException(status_code=404, detail="Job non trouvé")
+    return {
+        "jobId": row["jobId"],
+        "status": row["status"],
+        "position": 1 if row["status"] == "pending" else 0,
+        "total": 1,
+        "estimatedTime": 30 if row["status"] in ("pending", "processing") else 0,
+    }
+
+
+@app.get("/api/agent-readiness/results")
+async def get_agent_readiness_results(jobId: str, _user: str = Depends(require_auth)):
+    if USE_DB:
+        try:
+            from database.db import get_session
+            from database.service import get_agent_readiness_job
+
+            session = get_session()
+            try:
+                row = get_agent_readiness_job(session, jobId)
+            finally:
+                session.close()
+            if not row:
+                raise HTTPException(status_code=404, detail="Job non trouvé")
+            if row["status"] != "completed":
+                return {"jobId": jobId, "status": row["status"]}
+            return row["result"]
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Erreur résultats: {e}")
+
+    row = _agent_readiness_jobs.get(jobId)
+    if not row:
+        raise HTTPException(status_code=404, detail="Job non trouvé")
+    if row["status"] != "completed":
+        return {"jobId": jobId, "status": row["status"]}
+    return row["result"]
+
+
+@app.get("/api/agent-readiness/results/{job_id}/export")
+async def export_agent_readiness_result(job_id: str, _user: str = Depends(require_auth)):
+    if USE_DB:
+        try:
+            from database.db import get_session
+            from database.service import get_agent_readiness_job
+
+            session = get_session()
+            try:
+                row = get_agent_readiness_job(session, job_id)
+            finally:
+                session.close()
+            if not row:
+                raise HTTPException(status_code=404, detail="Job non trouvé")
+            if row["status"] != "completed" or not row.get("result"):
+                return JSONResponse(status_code=409, content={"jobId": job_id, "status": row["status"], "detail": "Résultat non disponible"})
+            payload = json.dumps(row["result"], ensure_ascii=False, indent=2).encode("utf-8")
+            return Response(
+                content=payload,
+                media_type="application/json; charset=utf-8",
+                headers={"Content-Disposition": f'attachment; filename="agent-readiness-{job_id}.json"'},
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Erreur export: {e}")
+
+    row = _agent_readiness_jobs.get(job_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Job non trouvé")
+    if row["status"] != "completed" or not row.get("result"):
+        return JSONResponse(status_code=409, content={"jobId": job_id, "status": row["status"], "detail": "Résultat non disponible"})
+    payload = json.dumps(row["result"], ensure_ascii=False, indent=2).encode("utf-8")
+    return Response(
+        content=payload,
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="agent-readiness-{job_id}.json"'},
+    )
+
+
+@app.get("/api/agent-readiness/history")
+async def get_agent_readiness_history(page: int = 1, limit: int = 20, _user: str = Depends(require_auth)):
+    from agent_readiness import get_cache_metrics
+    if USE_DB:
+        try:
+            from database.db import get_session
+            from database.service import list_agent_readiness_jobs
+
+            session = get_session()
+            try:
+                history = list_agent_readiness_jobs(session, page=page, limit=min(max(limit, 1), 100))
+                history["cacheMetrics"] = get_cache_metrics()
+                return history
+            finally:
+                session.close()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Erreur historique: {e}")
+
+    rows = sorted(_agent_readiness_jobs.values(), key=lambda x: x.get("createdAt", ""), reverse=True)
+    start = (max(page, 1) - 1) * min(max(limit, 1), 100)
+    end = start + min(max(limit, 1), 100)
+    scans = [
+        {
+            "jobId": r["jobId"],
+            "url": r["url"],
+            "domain": r["domain"],
+            "status": r["status"],
+            "createdAt": r["createdAt"],
+            "completedAt": r.get("completedAt"),
+        }
+        for r in rows[start:end]
+    ]
+    return {
+        "scans": scans,
+        "total": len(rows),
+        "page": max(page, 1),
+        "limit": min(max(limit, 1), 100),
+        "cacheMetrics": get_cache_metrics(),
+    }
+
+
+@app.delete("/api/agent-readiness/results/{job_id}")
+async def delete_agent_readiness_result(job_id: str, _user: str = Depends(require_auth)):
+    from urllib.parse import urlparse
+    from agent_readiness import invalidate_cache_for_domain
+    if USE_DB:
+        try:
+            from database.db import get_session
+            from database.service import delete_agent_readiness_job, get_agent_readiness_job
+
+            session = get_session()
+            try:
+                existing = get_agent_readiness_job(session, job_id)
+                deleted = delete_agent_readiness_job(session, job_id)
+            finally:
+                session.close()
+            if not deleted:
+                raise HTTPException(status_code=404, detail="Job non trouvé")
+            invalidated = 0
+            if existing and existing.get("url"):
+                invalidated = invalidate_cache_for_domain(urlparse(existing["url"]).netloc.lower())
+            return {"jobId": job_id, "deleted": True, "cacheInvalidatedEntries": invalidated}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Erreur suppression: {e}")
+
+    if job_id not in _agent_readiness_jobs:
+        raise HTTPException(status_code=404, detail="Job non trouvé")
+    row = _agent_readiness_jobs[job_id]
+    invalidated = 0
+    if row.get("url"):
+        invalidated = invalidate_cache_for_domain(urlparse(row["url"]).netloc.lower())
+    del _agent_readiness_jobs[job_id]
+    return {"jobId": job_id, "deleted": True, "cacheInvalidatedEntries": invalidated}
+
+
+@app.post("/api/agent-readiness/cache/flush")
+async def flush_agent_readiness_cache(_user: str = Depends(require_auth)):
+    from agent_readiness import flush_cache, get_cache_metrics
+
+    flushed = flush_cache()
+    metrics = get_cache_metrics()
+    return {"ok": True, "flushedEntries": flushed, "cacheMetrics": metrics}
 
 
 class WorkerFetchConfigResponse(BaseModel):

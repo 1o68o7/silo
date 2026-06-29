@@ -122,3 +122,16 @@ class ComputedOpportunity(Base):
     zone_texte = Column(Text)
     phrase_ancre_proposee = Column(String(512))
     computed_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AgentReadinessScan(Base):
+    __tablename__ = "agent_readiness_scans"
+
+    job_id = Column(String(36), primary_key=True)
+    url = Column(String(2048), nullable=False)
+    domain = Column(String(255), nullable=False, index=True)
+    status = Column(String(20), default="pending")
+    result = Column(JSONB, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    completed_at = Column(DateTime, nullable=True)

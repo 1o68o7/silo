@@ -9,7 +9,16 @@ import uuid
 from sqlalchemy import func, text, or_
 from sqlalchemy.orm import Session
 
-from .models import Project, Page, Edge, OpportunityRecord, ComputedOpportunity, CrawlQueue, EMBEDDING_DIM
+from .models import (
+    Project,
+    Page,
+    Edge,
+    OpportunityRecord,
+    ComputedOpportunity,
+    CrawlQueue,
+    AgentReadinessScan,
+    EMBEDDING_DIM,
+)
 from .db import get_engine, get_session, init_db
 
 
@@ -1481,3 +1490,85 @@ def delete_opportunity_record(session: Session, project_id: str, record_id: int)
         session.commit()
         return True
     return False
+
+
+def create_agent_readiness_job(session: Session, job_id: str, url: str, domain: str) -> dict:
+    row = AgentReadinessScan(job_id=job_id, url=url, domain=domain, status="pending")
+    session.add(row)
+    session.commit()
+    return {"jobId": row.job_id, "status": row.status, "createdAt": row.created_at.isoformat() + "Z"}
+
+
+def mark_agent_readiness_processing(session: Session, job_id: str) -> bool:
+    row = session.query(AgentReadinessScan).filter(AgentReadinessScan.job_id == job_id).first()
+    if not row:
+        return False
+    row.status = "processing"
+    session.commit()
+    return True
+
+
+def complete_agent_readiness_job(session: Session, job_id: str, result: dict) -> bool:
+    row = session.query(AgentReadinessScan).filter(AgentReadinessScan.job_id == job_id).first()
+    if not row:
+        return False
+    row.status = "completed"
+    row.result = result
+    row.completed_at = datetime.utcnow()
+    session.commit()
+    return True
+
+
+def fail_agent_readiness_job(session: Session, job_id: str, error: str) -> bool:
+    row = session.query(AgentReadinessScan).filter(AgentReadinessScan.job_id == job_id).first()
+    if not row:
+        return False
+    row.status = "failed"
+    row.error = error[:4000]
+    row.completed_at = datetime.utcnow()
+    session.commit()
+    return True
+
+
+def get_agent_readiness_job(session: Session, job_id: str) -> dict | None:
+    row = session.query(AgentReadinessScan).filter(AgentReadinessScan.job_id == job_id).first()
+    if not row:
+        return None
+    return {
+        "jobId": row.job_id,
+        "url": row.url,
+        "domain": row.domain,
+        "status": row.status,
+        "result": row.result,
+        "error": row.error,
+        "createdAt": row.created_at.isoformat() + "Z" if row.created_at else None,
+        "completedAt": row.completed_at.isoformat() + "Z" if row.completed_at else None,
+    }
+
+
+def list_agent_readiness_jobs(session: Session, page: int = 1, limit: int = 20) -> dict:
+    q = session.query(AgentReadinessScan).order_by(AgentReadinessScan.created_at.desc())
+    total = q.count()
+    rows = q.offset((max(page, 1) - 1) * max(limit, 1)).limit(max(limit, 1)).all()
+    scans = []
+    for r in rows:
+        scans.append(
+            {
+                "jobId": r.job_id,
+                "url": r.url,
+                "domain": r.domain,
+                "status": r.status,
+                "createdAt": r.created_at.isoformat() + "Z" if r.created_at else None,
+                "completedAt": r.completed_at.isoformat() + "Z" if r.completed_at else None,
+            }
+        )
+    return {"scans": scans, "total": total, "page": max(page, 1), "limit": max(limit, 1)}
+
+
+def delete_agent_readiness_job(session: Session, job_id: str) -> bool:
+    row = session.query(AgentReadinessScan).filter(AgentReadinessScan.job_id == job_id).first()
+    if not row:
+        return False
+    session.delete(row)
+    session.commit()
+    return True
